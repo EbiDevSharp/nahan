@@ -3306,7 +3306,7 @@ function getDashboardUI(hasDB) {
                                       <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
                                   <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
+                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
                                       <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
                                   <div>
@@ -3526,7 +3526,7 @@ function getDashboardUI(hasDB) {
                   user_mgt_title: "User Management", user_mgt_desc: "Manage multiple users, set traffic limits, and expiration dates.", btn_add_user: "+ Add New User",
                   tbl_name: "Name", tbl_uuid: "UUID", tbl_traffic: "Traffic (Used / Limit)", tbl_exp: "Expiration", tbl_action: "Action", no_users: "No users found. Create one above.",
                   modal_add_title: "Add New User", lbl_u_name: "Name (Required)", lbl_u_gb: "Traffic Limit (GB) - Optional", lbl_u_days: "Duration (Days) - Optional", btn_cancel: "Cancel", btn_confirm: "Add User",
-                  limit_total: "Total Requests Limit (Leave empty for unlimited)", limit_daily: "Daily Requests Limit (Leave empty for unlimited)",
+                  limit_total: "Traffic (GB) Limit (Leave empty for unlimited)", limit_daily: "Daily Requests Limit (Leave empty for unlimited)",
                   limit_days: "Expiration limit (Days) - Leave empty for unlimited", edit_sub: "Edit Subscriber", lbl_name_ph: "Name or UUID",
                   btn_save_changes: "Save Changes", save_btn_user: "Save User", status_active: "Active", status_paused: "Paused", status_expired: "Expired",
                   stat_total_subscribers: "Total Subscribers", stat_active_paused: "Active / Paused", stat_cumulative_traffic: "Cumulative Traffic",
@@ -3565,7 +3565,7 @@ function getDashboardUI(hasDB) {
                   target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
                   lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
                   slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
-                  force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (برای نامحدود خالی بگذارید)",
+                  force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
                   limit_days: "مدت زمان اعتبار قانونی (روز) - برای نامحدود خالی بگذارید", edit_sub: "ویرایش مشترک", lbl_name_ph: "نام یا شناسه یکتا",
                   btn_save_changes: "ذخیره تغییرات", save_btn_user: "ثبت کاربر جدید", status_active: "فعال", status_paused: "متوقف شده", status_expired: "منقضی شده",
                   export_btn: "📥 برون‌بری فایل پیکربندی (نسخه پشتیبان)", import_btn: "📤 درون‌ریزی فایل پیکربندی (نسخه پشتیبان)",
@@ -4259,7 +4259,9 @@ function getDashboardUI(hasDB) {
           function commitAddUser() {
               const name = document.getElementById('add-user-name').value;
               let tReq = document.getElementById('add-user-total-reqs').value;
+              tReq = tReq? Math.floor(parseFloat(tReq) * 6000): null;
               let dReq = document.getElementById('add-user-daily-reqs').value;
+              dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('add-user-days').value;
               const proxyIp = document.getElementById('add-user-proxy-ip').value || null;
               
@@ -4307,8 +4309,8 @@ function getDashboardUI(hasDB) {
               
               document.getElementById('edit-user-id').value = u.id;
               document.getElementById('edit-user-name').value = u.name;
-              document.getElementById('edit-user-total-reqs').value = u.limitTotalReq || '';
-              document.getElementById('edit-user-daily-reqs').value = u.limitDailyReq || '';
+              document.getElementById('edit-user-total-reqs').value = u.limitTotalReq? (u.limitTotalReq / 6000).toFixed(2): '';
+              document.getElementById('edit-user-daily-reqs').value = u.limitDailyReq? (u.limitDailyReq / 6000).toFixed(2): '';
               document.getElementById('edit-user-proxy-ip').value = u.proxyIp || '';
               
               let daysLeft = '';
@@ -4325,7 +4327,9 @@ function getDashboardUI(hasDB) {
               const uuid = document.getElementById('edit-user-id').value;
               const name = document.getElementById('edit-user-name').value;
               let tReq = document.getElementById('edit-user-total-reqs').value;
+              tReq = tReq? Math.floor(parseFloat(tReq) * 6000): null;
               let dReq = document.getElementById('edit-user-daily-reqs').value;
+              dReq = dReq? Math.floor(parseFloat(dReq) * 6000): null;
               let days = document.getElementById('edit-user-days').value;
               const proxyIp = document.getElementById('edit-user-proxy-ip').value || null;
               
