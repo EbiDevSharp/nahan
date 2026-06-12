@@ -4001,7 +4001,7 @@ function getDashboardUI(hasDB) {
                                   \${isDef ? '<span class="text-[10px] bg-slate-100 text-slate-500 px-2 py-1 rounded font-bold uppercase">Master</span>' : ''}
                               </div>
                               <div class="space-y-3">
-                                  <div>
+                                  <div> 
                                       <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">UUID</label>
                                       <div class="bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-darkborder px-3 py-2 rounded-lg text-xs font-mono text-slate-500">\${p.id}</div>
                                   </div>
