@@ -4282,6 +4282,7 @@ function getDashboardUI(hasDB) {
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
                                       <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
+                                   
                                   <div>
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
                                       <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
@@ -4294,6 +4295,9 @@ function getDashboardUI(hasDB) {
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
                                       <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
+                                  
+                                   
+                                  
                                   <div>
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
                                       <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
@@ -4343,6 +4347,7 @@ function getDashboardUI(hasDB) {
                                       <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
                                       <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                   </div>
+                                  
                                   <div>
                                       <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
                                       <input type="text" id="edit-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
@@ -5149,6 +5154,14 @@ function getDashboardUI(hasDB) {
                       namePrefix: el('cfg-name-prefix').value
                   }
               };
+                      //Update User Port By Global Port(if Global        
+                const globalPorts = (payload.config.socketPorts||443).split(',').map(s=>s.trim()).filter(Boolean);
+                payload.config.users = (window.nahanConfig.users || []).map(u => {
+                if (!u.userPorts) return u;
+                const filtered = u.userPorts.split(',').map(s=>s.trim()).filter(p => globalPorts.includes(p));
+                u.userPorts = filtered.length ? filtered.join(',') : globalPorts[0];
+                    return u;
+                });
               const stat = el('save-status'); stat.textContent = i18n[lang].msg_saving; stat.className = "text-sm font-bold text-primary animate-pulse md:me-4";
               try {
                   const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
