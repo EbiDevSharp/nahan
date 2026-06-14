@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.1";
+const CURRENT_VERSION = "2.5.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -4274,46 +4274,52 @@ function getDashboardUI(hasDB) {
                       </div>
 
                       <!-- Modal: Add User -->
-                      <div id="modal-add-user" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl w-full max-w-md p-6 shadow-2xl border border-slate-200 dark:border-darkborder">
-                              <h3 class="text-xl font-bold mb-4" data-i18n="modal_add_title">Add User</h3>
-                              <div class="space-y-4">
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
-                                      <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
-                                      <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                      <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
-                                      <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                      <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                      <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
-                                          <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                          <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                      <div id="modal-add-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="modal_add_title">Add User</h3>
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-4">
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_name">Name / Identifier</label>
+                                          <input type="text" id="add-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
+                                          <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
+                                          <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
+                                          <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ipproxy">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
+                                          <input type="text" id="add-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
+                                          <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
+                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                          </div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
+                                          <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
+                                          <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
                                   </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                      <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                      <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  </div>
-                                  <div class="flex justify-end gap-2 mt-6">
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="save_btn_user">Save User</button>
                                   </div>
@@ -4322,47 +4328,53 @@ function getDashboardUI(hasDB) {
                       </div>
 
                       <!-- Modal: Edit User -->
-                      <div id="modal-edit-user" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl w-full max-w-md p-6 shadow-2xl border border-slate-200 dark:border-darkborder">
-                              <h3 class="text-xl font-bold mb-4" data-i18n="edit_sub">Edit Subscriber</h3>
-                              <input type="hidden" id="edit-user-id">
-                              <div class="space-y-4">
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_name_ph">Name / Identifier</label>
-                                      <input type="text" id="edit-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
-                                      <input type="number" id="edit-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                      <input type="number" id="edit-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
-                                      <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
-                                      <input type="text" id="edit-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                      <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
-                                          <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                          <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                      <div id="modal-edit-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="edit_sub">Edit Subscriber</h3>
+                                  <input type="hidden" id="edit-user-id">
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-4">
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_name_ph">Name / Identifier</label>
+                                          <input type="text" id="edit-user-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
+                                          <input type="number" id="edit-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
+                                          <input type="number" id="edit-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
+                                          <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1">User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)</label>
+                                          <input type="text" id="edit-user-proxy-ip" placeholder="e.g. 104.20.0.1, proxyip.com" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
+                                          <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
+                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                          </div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
+                                          <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
+                                          <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
                                   </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                      <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                  </div>
-                                  <div>
-                                      <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                      <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                  </div>
-                                  <div class="flex justify-end gap-2 mt-6">
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-edit-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitEditUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_save_changes">Save Changes</button>
                                   </div>
@@ -4565,6 +4577,20 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "2.5.2": {
+                  headline: { en: "Modal Responsiveness & Mobile UX", fa: "واکنش‌گرایی مودال و تجربه کاربری موبایل" },
+                  added: [],
+                  fixed: [],
+                  improved: [
+                      { en: "Improved Add/Edit User modal responsiveness on all screen sizes", fa: "بهبود واکنش‌گرایی مودال افزودن/ویرایش کاربر در تمام اندازه‌های صفحه" },
+                      { en: "Added sticky action buttons in modals for better mobile support", fa: "افزودن دکمه‌های شناور در مودال‌ها برای پشتیبانی بهتر از موبایل" },
+                      { en: "Enhanced scrolling behavior — form content scrolls independently while buttons stay visible", fa: "بهبود رفتار اسکرول — محتوای فرم به‌طور مستقل اسکرول می‌شود در حالی که دکمه‌ها قابل مشاهده باقی می‌مانند" },
+                      { en: "Improved overall user experience when managing subscribers", fa: "بهبود تجربه کاربری هنگام مدیریت مشترکین" },
+                  ],
+                  notes: [
+                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
+                  ]
+              },
               "2.5.1": {
                   headline: { en: "Simplified Panel Management & Bot Stability", fa: "مدیریت ساده‌شده پنل و پایداری ربات" },
                   added: [
