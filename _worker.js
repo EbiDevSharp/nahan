@@ -6477,32 +6477,57 @@ function getDashboardUI(hasDB) {
               buildIPCheckboxes("add-user-proxy-ips-wrap", "", (window.nahanConfig?.backupRelay||"").split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
           }
 
-          
-function buildIPCheckboxes(wrapId, selectedIps, allIps) {
-    const wrap = document.getElementById(wrapId);
-    if(!wrap) return;
-    wrap.innerHTML = '';
-    if(!allIps || allIps.length === 0) {
-        wrap.innerHTML = '<span class="text-xs text-slate-400">No IPs added in Advanced Tab</span>';
-        return;
-    }
-    const selArr = selectedIps ? selectedIps.split(',').map(s=>s.trim()).filter(Boolean) : [];
-    allIps.forEach(ip => {
-        const lbl = document.createElement('label');
-        lbl.className = "flex items-center gap-1.5 text-sm cursor-pointer border border-slate-200 dark:border-darkborder px-2 py-1 rounded-lg";
-        const cb = document.createElement('input');
-        cb.type = "checkbox";
-        cb.className = "accent-primary";
-        cb.value = ip;
-        if(selArr.includes(ip)) cb.checked = true;
+          function buildIPCheckboxes(wrapId, selectedIps, allIps) {
+            const wrap = document.getElementById(wrapId);
+            if (!wrap) return;
         
-        lbl.appendChild(cb);
-        const span = document.createElement('span');
-        span.innerText = ip;
-        lbl.appendChild(span);
-        wrap.appendChild(lbl);
-    });
-}
+            wrap.innerHTML = '';
+        
+            if (!allIps || allIps.length === 0) {
+                wrap.innerHTML = '<span class="text-xs text-slate-400">No IPs added in Advanced Tab</span>';
+                return;
+            }
+        
+            const selArr = selectedIps
+                ? selectedIps.split(',').map(s => s.trim()).filter(Boolean)
+                : [];
+        
+            // 🔥 outer wrapper = دقیقا مثل inputهای فرم
+            const container = document.createElement('div');
+            container.className =
+                "w-full border border-slate-200 dark:border-darkborder rounded-xl bg-white dark:bg-darkcard";
+        
+            // 🔥 scroll area + grid
+            const grid = document.createElement('div');
+            grid.className =
+                "max-h-64 overflow-y-auto p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2";
+        
+            allIps.forEach(ip => {
+                const lbl = document.createElement('label');
+                lbl.className =
+                    "flex items-center gap-2 text-xs cursor-pointer px-2 py-1 rounded-md " +
+                    "border border-slate-200 dark:border-darkborder hover:bg-slate-50 dark:hover:bg-slate-800 transition";
+        
+                const cb = document.createElement('input');
+                cb.type = "checkbox";
+                cb.className = "accent-primary";
+                cb.value = ip;
+        
+                if (selArr.includes(ip)) cb.checked = true;
+        
+                const span = document.createElement('span');
+                span.textContent = ip;
+        
+                lbl.appendChild(cb);
+                lbl.appendChild(span);
+        
+                grid.appendChild(lbl);
+            });
+        
+            container.appendChild(grid);
+            wrap.appendChild(container);
+        }
+          
 function getSelectedCheckboxes(wrapId) {
     const wrap = document.getElementById(wrapId);
     if(!wrap) return '';
