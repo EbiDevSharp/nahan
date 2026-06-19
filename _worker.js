@@ -2942,6 +2942,27 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null) {
     let cleanName = profileName === "Default" ? "" : `-${profileName}`;
     let typeLab = type === "alpha" ? "V" : "T";
     
+    if (strategy.includes('{') && strategy.includes('}')) {
+        let lookupIp = ip;
+        if (proxyIp) {
+            let pips = getProxyIpsArray(proxyIp);
+            if (pips.length > 0) lookupIp = pips[0];
+        } else if (sysConfig.backupRelay) {
+            let pips = getProxyIpsArray(sysConfig.backupRelay);
+            if (pips.length > 0) lookupIp = pips[0];
+        }
+        let flagEmoji = getEmojiFlag(lookupIp);
+        let protoLab = type === "alpha" ? "VLESS" : "Trojan";
+        let resName = strategy
+            .replace(/{FLAG}/g, flagEmoji)
+            .replace(/{PROTOCOL}/g, protoLab)
+            .replace(/{USER}/g, profileName)
+            .replace(/{PORT}/g, port)
+            .replace(/{PREFIX}/g, prefix)
+            .replace(/{IP}/g, ip || '');
+        return resName;
+    }
+    
     if (strategy === "type-user-port") {
         return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
     } else if (strategy === "user-port") {
@@ -2950,10 +2971,10 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null) {
         return `${hostName}-${port}${cleanName}`;
     } else if (strategy === "prefix-user-port") {
         return `${prefix}${cleanName}-${port}`;
-    }
+    } 
     else if (strategy === "ip") {
-    return ip || 'unknown';
-}
+        return ip || 'unknown';
+    }
     
     else { // "default"
         return `${typeLab}-Core-${port}${cleanName}`;
