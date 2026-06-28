@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.9";
+const CURRENT_VERSION = "2.6.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -1662,6 +1662,10 @@ async function fetchRemotePanelConfig(panel) {
     return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.masterKey });
 }
 
+async function fetchRemotePanelUpdate(panel, action, extra = {}) {
+    return await remotePanelFetch(panel, 'POST', '/api/update', { key: panel.masterKey, action, ...extra });
+}
+
 async function remotePanelWriteAction(panel, method, userId, body = null) {
     let path = '/api/users';
     if (userId) path += `?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.masterKey)}`;
@@ -1804,11 +1808,9 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
                     ]);
                 }
-                if (isLocal) {
-                    inline_keyboard.push([
-                        { text: `${t("btn_check_update")}`, callback_data: "sys_check_update" }
-                    ]);
-                }
+                inline_keyboard.push([
+                    { text: `${t("btn_check_update")}`, callback_data: "sys_check_update" }
+                ]);
             }
             inline_keyboard.push([
                 { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
@@ -2179,6 +2181,33 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 } else if (data === "sys_check_update") {
                     await sendOrEdit(chatId, t("msg_checking_update"), { inline_keyboard: [] }, messageId);
+
+                    if (isRemotePanel) {
+                        const res = await fetchRemotePanelUpdate(activePanel, "check");
+                        if (!res || !res.success) {
+                            await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            return new Response("OK", { status: 200 });
+                        }
+                        if (!res.updateAvailable) {
+                            const text = t("msg_no_update").replace("{version}", res.current);
+                            await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            return new Response("OK", { status: 200 });
+                        }
+                        const text = t("msg_update_available").replace("{current}", res.current).replace("{latest}", res.latest);
+                        if (!res.canDeploy) {
+                            await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            return new Response("OK", { status: 200 });
+                        }
+                        const kb = {
+                            inline_keyboard: [
+                                [{ text: t("btn_deploy_update"), callback_data: `sys_deploy_confirm:${res.latest}` }],
+                                [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                            ]
+                        };
+                        await sendOrEdit(chatId, text, kb, messageId);
+                        return new Response("OK", { status: 200 });
+                    }
+
                     const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan").replace(/https?:\/\/github\.com\//, '').trim();
                     let remoteVer = null;
                     try {
@@ -2237,6 +2266,20 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 } else if (data.startsWith("sys_deploy_run:")) {
                     await sendOrEdit(chatId, t("msg_deploying"), { inline_keyboard: [] }, messageId);
+
+                    if (isRemotePanel) {
+                        let deployResultText;
+                        const res = await fetchRemotePanelUpdate(activePanel, "deploy");
+                        if (res && res.success) {
+                            deployResultText = t("msg_deploy_success").replace("{version}", res.newVersion || "?");
+                        } else {
+                            deployResultText = t("msg_deploy_failed").replace("{error}", (res && res.error) || "Unknown error");
+                        }
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        await sendOrEdit(chatId, deployResultText, kb, messageId);
+                        return new Response("OK", { status: 200 });
+                    }
+
                     const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan").replace(/https?:\/\/github\.com\//, '').trim();
                     let deployResultText;
                     try {
