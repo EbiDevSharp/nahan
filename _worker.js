@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.7";
+const CURRENT_VERSION = "2.5.7.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -51,7 +51,7 @@ const SYSTEM_DEFAULTS = {
     cfWorkerName: "",
     isPaused: false,
     silentAlerts: false,
-    githubRepo: "itsyebekhe/nahan",
+    githubRepo: "EbiDevSharp/nahan",
     nameStrategy: "default",
     namePrefix: "Core",
     tgBotLang: "fa",
@@ -63,6 +63,7 @@ const SYSTEM_DEFAULTS = {
     linkedPanels: [],
     hubPanelUrl: "",
     allowSyncWorker: false,
+    add_panel: "Add Panel",
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -293,6 +294,9 @@ export default {
                     return new Response(getDashboardUI(env.IOT_DB !== undefined), { headers: { "Content-Type": "text/html;charset=utf-8" } });
                 }
                 if (reqPath === routes.auth) {
+                    if (request.method === "OPTIONS") {
+                        return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
+                    }
                     if (request.method !== "POST") return new Response("405", { status: 405 });
                     return await handleAuth(request, url.hostname, ctx, env);
                 }
@@ -1146,7 +1150,7 @@ async function handleUpdateApi(request, env, ctx) {
         const accountId = sysConfig.cfAccountId;
         const apiToken = sysConfig.cfApiToken;
         const workerName = sysConfig.cfWorkerName;
-        const repo = (sysConfig.githubRepo || "itsyebekhe/nahan").replace(/https?:\/\/github\.com\//, '').trim();
+        const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan").replace(/https?:\/\/github\.com\//, '').trim();
 
         if (data.action === "check") {
             let remoteVer = null;
@@ -1301,12 +1305,12 @@ async function handleAuth(request, hostName, ctx, env) {
                         sync: `${protocol}://${baseHost}/${sysConfig.apiRoute}${subSuffix}`
                     };
                 })
-            }), { status: 200 });
+            }), { status: 200, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
         }
         ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
         if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!", hostName));
-        return new Response(JSON.stringify({ success: false }), { status: 401 });
-    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+        return new Response(JSON.stringify({ success: false }), { status: 401, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
+    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } }); }
 }
 
 async function handleConfigSync(request, env, ctx) {
@@ -1576,6 +1580,7 @@ const botI18n = {
         btn_sub_link: "🔗 لینک اشتراک",
         sub_link_sent: "✅ لینک اشتراک ارسال شد!",
         btn_update_usage: "🔄 بروزرسانی مصرف",
+	add_panel: "افزودن پنل",
     }
 };
 
@@ -1761,10 +1766,22 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             inline_keyboard.push([
                 { text: `🔗 ${t("btn_sub_link")}`, callback_data: "get_sub_link" }
             ]);
+
             if (isAdmin) {
                 inline_keyboard.push([
                     { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
                 ]);
+                const allPanels = getPanelsList();
+                if (allPanels.length > 1) {
+                    inline_keyboard.push([
+                        { text: `🔄 ${t("switch_panel")}`, callback_data: "switch_panel" },
+                        { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
+                    ]);
+                } else {
+                    inline_keyboard.push([
+                        { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
+                    ]);
+                }
             }
             inline_keyboard.push([
                 { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
@@ -2332,6 +2349,88 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
                     await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
+			// ===== تغییر ۲: داخل callback handler، قبل از خط "get_sub_link" =====
+// این بلاک رو اضافه کن:
+                } else if (data === "switch_panel") {
+                    const allPanels = getPanelsList();
+                    let txt = `🔄 **${t("switch_panel")}**\n━━━━━━━━━━━━━━━━\n`;
+                    const kb_rows = allPanels.map((p, i) => {
+                        const isActive = activePanel && (p.isLocal === activePanel.isLocal) && (p.isLocal || p.host === activePanel.host);
+                        const row = [{ text: `${isActive ? '✅ ' : ''}${p.isLocal ? '🏠' : '🌐'} ${p.name}`, callback_data: `panel_select:${i}` }];
+                        if (!p.isLocal) {
+                            row.push({ text: "🗑️", callback_data: `panel_remove_init:${i}` });
+                        }
+                        return row;
+                    });
+                    kb_rows.push([{ text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }]);
+                    kb_rows.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                    await sendOrEdit(chatId, txt + t("select_panel"), { inline_keyboard: kb_rows }, messageId);
+
+                } else if (data.startsWith("panel_select:")) {
+                    const idx = parseInt(data.replace("panel_select:", ""));
+                    const allPanels = getPanelsList();
+                    const chosen = allPanels[idx];
+                    if (!chosen) {
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                    } else {
+                        const loginSignal = {
+                            name: chosen.name,
+                            host: chosen.host,
+                            apiRoute: chosen.apiRoute || sysConfig.apiRoute,
+                            masterKey: chosen.masterKey,
+                            isLocal: chosen.isLocal,
+                            ts: Date.now()
+                        };
+                        if (env.IOT_DB) {
+                            await d1Put(env, "tg_panel_login", JSON.stringify(loginSignal));
+                        }
+                        lastLoginPanel = loginSignal;
+                        const newActive = chosen;
+                        const menu = getMainMenu(newActive, isAuthorized);
+                        await sendOrEdit(chatId, `✅ ${t("msg_panel_selected")}\n\n` + menu.text, menu.kb, messageId);
+                    }
+
+                } else if (data === "add_panel_init") {
+                    tgState[chatId] = { step: "add_panel_url" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const langCode = sysConfig.tgBotLang || "fa";
+                    const msg = langCode === "fa"
+                        ? "🔌 آدرس پنل جدید را ارسال کنید:\n_(مثال: `myworker.workers.dev`)_"
+                        : "🔌 Send the new panel URL:\n_(e.g. `myworker.workers.dev`)_";
+                    await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] }, messageId);
+
+                } else if (data.startsWith("panel_remove_init:")) {
+                    const idx = parseInt(data.replace("panel_remove_init:", ""));
+                    const allPanels = getPanelsList();
+                    const chosen = allPanels[idx];
+                    if (!chosen || chosen.isLocal) {
+                        await sendOrEdit(chatId, "❌ Cannot remove local panel.", { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                    } else {
+                        const langCode = sysConfig.tgBotLang || "fa";
+                        const msg = langCode === "fa"
+                            ? `⚠️ آیا از حذف پنل **${chosen.name}** مطمئن هستید؟`
+                            : `⚠️ Are you sure you want to remove panel **${chosen.name}**?`;
+                        await sendOrEdit(chatId, msg, { inline_keyboard: [
+                            [{ text: `✅ ${t("btn_confirm")}`, callback_data: `panel_remove_confirm:${idx}` }],
+                            [{ text: `❌ ${t("btn_cancel")}`, callback_data: "switch_panel" }]
+                        ]}, messageId);
+                    }
+
+                } else if (data.startsWith("panel_remove_confirm:")) {
+                    const idx = parseInt(data.replace("panel_remove_confirm:", ""));
+                    const allPanels = getPanelsList();
+                    const chosen = allPanels[idx];
+                    if (chosen && !chosen.isLocal) {
+                        sysConfig.linkedPanels = (sysConfig.linkedPanels || []).filter(p => p.host !== chosen.host);
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        // اگه پنل حذف شده همون active بود برگرد به local
+                        if (!activePanel?.isLocal && activePanel?.host === chosen.host) {
+                            const localSignal = { name: sysConfig.name || "Main Panel", host: null, apiRoute: sysConfig.apiRoute, masterKey: null, isLocal: true, ts: Date.now() };
+                            await d1Put(env, "tg_panel_login", JSON.stringify(localSignal));
+                        }
+                    }
+                    const menu = getMainMenu(getPanelsList()[0], isAuthorized);
+                    await sendOrEdit(chatId, `🗑️ Panel removed.\n\n` + menu.text, menu.kb, messageId);
                 } else if (data === "get_sub_link") {
                     const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
                     await fetch(`${tgApi}/sendMessage`, {
@@ -2504,7 +2603,95 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await sendOrEdit(chatId, `✅ Limits Updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
+			// ===== تغییر ۳: داخل message/state handler، قبل از "sub_search" state =====
+// این بلاک رو اضافه کن:
+                    if (state.step === "add_panel_url") {
+                        const url = text.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+                        tgState[chatId] = { step: "add_panel_key", url };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        const langCode = sysConfig.tgBotLang || "fa";
+                        const msg = langCode === "fa"
+                            ? `🔑 Master Key پنل \`${url}\` را ارسال کنید:`
+                            : `🔑 Send the Master Key for \`${url}\`:`;
+                        await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
 
+                    if (state.step === "add_panel_key") {
+                        const panelUrl = state.url;
+                        const masterKey = text.trim();
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+
+                        // چک کردن پنل جدید
+                        let verifyRes = null;
+                        try {
+                            const r = await fetch(`https://${panelUrl}/${encodeURI(sysConfig.apiRoute)}/api/auth`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ key: masterKey }),
+                                signal: AbortSignal.timeout(8000)
+                            });
+                            verifyRes = await r.json();
+                        } catch(e) {
+                            // آدرس api route رو نمیدونیم، sync رو هم امتحان میکنیم
+                        }
+
+                        // اگه route متفاوته امتحان با sync
+                        if (!verifyRes?.success) {
+                            try {
+                                const r2 = await fetch(`https://${panelUrl}/api/auth`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ key: masterKey }),
+                                    signal: AbortSignal.timeout(8000)
+                                });
+                                verifyRes = await r2.json();
+                            } catch(e) {}
+                        }
+
+                        if (!verifyRes?.success) {
+                            const langCode = sysConfig.tgBotLang || "fa";
+                            const msg = langCode === "fa"
+                                ? "❌ اتصال به پنل ناموفق بود. آدرس یا Master Key را بررسی کنید."
+                                : "❌ Failed to connect. Check the URL or Master Key.";
+                            await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                            return new Response("OK", { status: 200 });
+                        }
+
+                        // چک امنیتی: tgAdminId باید یکی باشه
+                        const remoteTgAdminId = verifyRes.config?.tgAdminId || verifyRes.config?.tgChatId;
+                        const localTgAdminId = sysConfig.tgAdminId || sysConfig.tgChatId;
+                        if (!remoteTgAdminId || remoteTgAdminId.toString() !== localTgAdminId.toString()) {
+                            const langCode = sysConfig.tgBotLang || "fa";
+                            const msg = langCode === "fa"
+                                ? "🚫 این پنل به ادمین دیگری تعلق دارد. امکان اضافه کردن وجود ندارد."
+                                : "🚫 This panel belongs to a different admin. Cannot add.";
+                            await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                            return new Response("OK", { status: 200 });
+                        }
+
+                        // اضافه کردن به linkedPanels
+                        if (!sysConfig.linkedPanels) sysConfig.linkedPanels = [];
+                        const alreadyExists = sysConfig.linkedPanels.some(p => p.host === panelUrl);
+                        if (!alreadyExists) {
+                            sysConfig.linkedPanels.push({
+                                name: verifyRes.config?.name || panelUrl,
+                                host: panelUrl,
+                                apiRoute: verifyRes.config?.apiRoute || sysConfig.apiRoute,
+                                masterKey: masterKey
+                            });
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+
+                        const langCode = sysConfig.tgBotLang || "fa";
+                        const successMsg = langCode === "fa"
+                            ? `✅ پنل **${verifyRes.config?.name || panelUrl}** با موفقیت اضافه شد!`
+                            : `✅ Panel **${verifyRes.config?.name || panelUrl}** added successfully!`;
+                        const menu = getMainMenu(getPanelsList().find(p => p.host === panelUrl) || getPanelsList()[0], isAuthorized);
+                        await sendOrEdit(chatId, successMsg + "\n\n" + menu.text, menu.kb);
+                        return new Response("OK", { status: 200 });
+                    }
                     if (state.step === "sub_search") {
                         const query = text.toLowerCase();
                         const panelUsers = await getPanelUsers();
@@ -4096,7 +4283,7 @@ function getDashboardUI(hasDB) {
       <!-- Global Controls -->
       <div class="fixed top-4 end-4 md:top-5 md:end-5 flex items-center gap-2 z-50">
           <span id="top-version-badge" class="px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold" style="background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);color:#818cf8;">v${CURRENT_VERSION}</span>
-          <a href="https://github.com/itsyebekhe/nahan" id="github-link-btn" target="_blank" class="p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;" onmouseover="this.style.color='#818cf8';this.style.borderColor='rgba(99,102,241,0.4)'" onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(255,255,255,0.1)'">
+          <a href="https://github.com/EbiDevSharp/nahan" id="github-link-btn" target="_blank" class="p-2 rounded-xl transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#94a3b8;" onmouseover="this.style.color='#818cf8';this.style.borderColor='rgba(99,102,241,0.4)'" onmouseout="this.style.color='#94a3b8';this.style.borderColor='rgba(255,255,255,0.1)'">
               <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
           </a>
           <button onclick="toggleLang()" id="lang-toggle" class="px-3 py-1.5 rounded-xl text-sm font-bold transition-all" style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;" onmouseover="this.style.borderColor='rgba(99,102,241,0.4)';this.style.color='#a5b4fc'" onmouseout="this.style.borderColor='rgba(255,255,255,0.1)';this.style.color='#e2e8f0'">EN</button>
@@ -4268,7 +4455,7 @@ function getDashboardUI(hasDB) {
                           </div>
                           <div id="update-deploy-status" class="hidden w-full mt-3 p-3 rounded-xl text-sm font-bold text-center"></div>
                           <div class="w-full mt-2 text-center">
-                              <a id="update-github-link" href="https://github.com/itsyebekhe/nahan" target="_blank" class="text-xs text-slate-400 hover:text-amber-500 transition-colors underline" data-i18n="view_github">View on GitHub</a>
+                              <a id="update-github-link" href="https://github.com/EbiDevSharp/nahan" target="_blank" class="text-xs text-slate-400 hover:text-amber-500 transition-colors underline" data-i18n="view_github">View on GitHub</a>
                           </div>
                       </div>
 
@@ -4566,7 +4753,7 @@ function getDashboardUI(hasDB) {
                               </div>
                               <div class="space-y-1 md:col-span-2">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_github_repo">GitHub Update Repository</label>
-                                  <input type="text" id="cfg-github-repo" placeholder="itsyebekhe/nahan" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <input type="text" id="cfg-github-repo" placeholder="EbiDevSharp/nahan" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                   <div class="flex justify-start items-center gap-2 mt-2">
                                       <button type="button" onclick="triggerManualRedeploy()" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary text-xs font-bold rounded-lg transition-colors border border-primary/20">
                                           🔄 <span data-i18n="btn_redeploy_force">Force Redeploy / Switch Format</span>
@@ -4741,6 +4928,16 @@ function getDashboardUI(hasDB) {
                                   <p class="text-xs text-slate-400 mt-1" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
                               </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
+                          </div>
+
+                          <!-- Linked Panels Section -->
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mt-6">
+                              <div class="flex items-center justify-between gap-3 mb-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_linked_panels">Linked Panels</label>
+                                  <button type="button" onclick="openAddPanelModal()" class="shrink-0 px-3 py-1.5 rounded-xl bg-primary text-white text-xs font-bold flex items-center gap-1">➕ <span data-i18n="btn_add_panel">Add Panel</span></button>
+                              </div>
+                              <p class="text-xs text-slate-400 mb-3" data-i18n="desc_linked_panels">Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.</p>
+                              <div id="linked-panels-list" class="space-y-2"></div>
                           </div>
                           
                           <!-- Cloudflare Usage Analytics -->
@@ -4962,6 +5159,37 @@ function getDashboardUI(hasDB) {
                                   <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="save_btn_user">Save User</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
+                      <!-- Modal: Add Linked Panel -->
+                      <div id="modal-add-panel" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="modal_add_panel_title">Add Linked Panel</h3>
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-4">
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_panel_url">Panel URL</label>
+                                          <input type="text" id="add-panel-url" placeholder="myworker.workers.dev" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_panel_key">Master Key</label>
+                                          <div class="relative">
+                                              <input type="password" id="add-panel-key" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-10">
+                                              <button type="button" onclick="const n=document.getElementById('add-panel-key');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
+                                          </div>
+                                      </div>
+                                      <p id="add-panel-status" class="text-xs font-bold min-h-[1rem]"></p>
+                                  </div>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-add-panel').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button id="btn-verify-add-panel" onclick="commitAddPanel()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_verify_add">Verify & Add</button>
                                   </div>
                               </div>
                           </div>
@@ -5266,6 +5494,7 @@ function getDashboardUI(hasDB) {
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
                   lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
+                  lbl_linked_panels: "Linked Panels", desc_linked_panels: "Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.", btn_add_panel: "Add Panel", no_linked_panels: "No linked panels yet.", modal_add_panel_title: "Add Linked Panel", lbl_panel_url: "Panel URL", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "Master Key", btn_verify_add: "Verify & Add", msg_verifying_panel: "Verifying panel...", msg_panel_verify_fail: "Failed to connect. Check the URL or Master Key.", msg_panel_added: "Panel added successfully.", msg_panel_admin_mismatch: "This panel belongs to a different Telegram admin and cannot be added.", confirm_remove_panel: "Are you sure you want to remove this panel?",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
@@ -5321,6 +5550,7 @@ function getDashboardUI(hasDB) {
                   lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
                   lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
+                  lbl_linked_panels: "پنل‌های لینک‌شده", desc_linked_panels: "پنل‌های دیگر (ورکرها) که به این پنل لینک شده‌اند را مدیریت کنید. می‌توان از طریق ربات تلگرام بین آن‌ها سوییچ کرد.", btn_add_panel: "افزودن پنل", no_linked_panels: "هنوز هیچ پنلی لینک نشده است.", modal_add_panel_title: "افزودن پنل لینک‌شده", lbl_panel_url: "آدرس پنل", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "Master Key", btn_verify_add: "تایید و افزودن", msg_verifying_panel: "در حال تایید پنل...", msg_panel_verify_fail: "اتصال ناموفق بود. آدرس یا Master Key را بررسی کنید.", msg_panel_added: "پنل با موفقیت اضافه شد.", msg_panel_admin_mismatch: "این پنل متعلق به ادمین تلگرام دیگری است و قابل افزودن نیست.", confirm_remove_panel: "آیا از حذف این پنل مطمئن هستید؟",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
@@ -6032,7 +6262,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-cf-worker').value = conf.cfWorkerName || '';
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
                       document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
-                      document.getElementById('cfg-github-repo').value = conf.githubRepo || 'itsyebekhe/nahan';
+                      document.getElementById('cfg-github-repo').value = conf.githubRepo || 'EbiDevSharp/nahan';
                       document.getElementById('cfg-name-strategy').value = conf.nameStrategy || 'default';
                       document.getElementById('cfg-name-prefix').value = conf.namePrefix || 'Core';
                       document.getElementById('cfg-sub-ua').value = conf.subUserAgent || '';
@@ -6042,6 +6272,7 @@ function getDashboardUI(hasDB) {
                       window.nahanUsage = data.sysUsage || {};
                       window.nahanProfiles = data.profiles || [];
                       renderUsersTable();
+                      renderLinkedPanels();
                       try { checkUpdate(); } catch(ue) { console.error(ue); }
                       if (!silent) switchTab('overview');
 
@@ -6462,6 +6693,131 @@ function getDashboardUI(hasDB) {
               }
               // Automatically sync
               renderUsersTable();
+              doSaveDirectly();
+          }
+
+          // ===== Linked Panels (Web Panel) =====
+          function renderLinkedPanels() {
+              const list = document.getElementById('linked-panels-list');
+              if (!list) return;
+              const panels = (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : [];
+              if (panels.length === 0) {
+                  const emptyMsg = i18n[lang]?.no_linked_panels || 'No linked panels yet.';
+                  list.innerHTML = '<p class="text-xs text-slate-400 text-center py-3">' + emptyMsg + '</p>';
+                  return;
+              }
+              list.innerHTML = panels.map((p, i) => {
+                  const safeName = (p.name || p.host || '').replace(/</g, '&lt;');
+                  const safeHost = (p.host || '').replace(/</g, '&lt;');
+                  return '<div class="flex items-center justify-between gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-2xl">' +
+                      '<div class="min-w-0">' +
+                          '<div class="text-sm font-bold text-slate-700 dark:text-slate-200 truncate">🌐 ' + safeName + '</div>' +
+                          '<div class="text-[11px] text-slate-400 font-mono truncate">' + safeHost + '</div>' +
+                      '</div>' +
+                      '<button type="button" onclick="removeLinkedPanel(' + i + ')" class="shrink-0 w-9 h-9 flex items-center justify-center rounded-xl bg-red-50 dark:bg-red-900/10 text-red-500 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors">🗑️</button>' +
+                  '</div>';
+              }).join('');
+          }
+
+          function openAddPanelModal() {
+              document.getElementById('add-panel-url').value = '';
+              document.getElementById('add-panel-key').value = '';
+              const statusEl = document.getElementById('add-panel-status');
+              statusEl.textContent = '';
+              statusEl.className = 'text-xs font-bold min-h-[1rem]';
+              document.getElementById('modal-add-panel').classList.remove('hidden');
+          }
+
+          async function commitAddPanel() {
+              const urlInput = document.getElementById('add-panel-url').value.trim();
+              const masterKey = document.getElementById('add-panel-key').value.trim();
+              const statusEl = document.getElementById('add-panel-status');
+              const btn = document.getElementById('btn-verify-add-panel');
+
+              if (!urlInput || !masterKey) {
+                  const reqMsg = lang === 'fa' ? 'آدرس پنل و Master Key الزامی است.' : 'Panel URL and Master Key are required.';
+                  statusEl.textContent = reqMsg;
+                  statusEl.className = 'text-xs font-bold min-h-[1rem] text-red-500';
+                  return;
+              }
+
+              const panelHost = urlInput.replace(/^https?:\\/\\//, '').replace(/\\/$/, '');
+              const origBtnText = btn.innerText;
+              btn.disabled = true;
+              statusEl.textContent = i18n[lang]?.msg_verifying_panel || 'Verifying panel...';
+              statusEl.className = 'text-xs font-bold min-h-[1rem] text-primary animate-pulse';
+
+              let verifyRes = null;
+              const myApiRoute = (window.nahanConfig && window.nahanConfig.apiRoute) ? window.nahanConfig.apiRoute : '';
+
+              try {
+                  const r1 = await fetch('https://' + panelHost + '/' + encodeURI(myApiRoute) + '/api/auth', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ key: masterKey }),
+                      signal: AbortSignal.timeout(8000)
+                  });
+                  verifyRes = await r1.json();
+              } catch(e) {}
+
+              if (!verifyRes || !verifyRes.success) {
+                  try {
+                      const r2 = await fetch('https://' + panelHost + '/api/auth', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ key: masterKey }),
+                          signal: AbortSignal.timeout(8000)
+                      });
+                      verifyRes = await r2.json();
+                  } catch(e) {}
+              }
+
+              if (!verifyRes || !verifyRes.success) {
+                  statusEl.textContent = i18n[lang]?.msg_panel_verify_fail || 'Failed to connect. Check the URL or Master Key.';
+                  statusEl.className = 'text-xs font-bold min-h-[1rem] text-red-500';
+                  btn.disabled = false;
+                  btn.innerText = origBtnText;
+                  return;
+              }
+
+              // Security check: tgAdminId must match, same rule as the Telegram bot flow
+              const remoteTgAdminId = verifyRes.config?.tgAdminId || verifyRes.config?.tgChatId;
+              const localTgAdminId = (window.nahanConfig && (window.nahanConfig.tgAdminId || window.nahanConfig.tgChatId)) || '';
+              if (!remoteTgAdminId || !localTgAdminId || remoteTgAdminId.toString() !== localTgAdminId.toString()) {
+                  statusEl.textContent = i18n[lang]?.msg_panel_admin_mismatch || 'This panel belongs to a different Telegram admin and cannot be added.';
+                  statusEl.className = 'text-xs font-bold min-h-[1rem] text-red-500';
+                  btn.disabled = false;
+                  btn.innerText = origBtnText;
+                  return;
+              }
+
+              if (!window.nahanConfig.linkedPanels) window.nahanConfig.linkedPanels = [];
+              const alreadyExists = window.nahanConfig.linkedPanels.some(p => p.host === panelHost);
+              if (!alreadyExists) {
+                  window.nahanConfig.linkedPanels.push({
+                      name: verifyRes.config?.name || panelHost,
+                      host: panelHost,
+                      apiRoute: verifyRes.config?.apiRoute || myApiRoute,
+                      masterKey: masterKey
+                  });
+              }
+
+              renderLinkedPanels();
+              statusEl.textContent = i18n[lang]?.msg_panel_added || 'Panel added successfully.';
+              statusEl.className = 'text-xs font-bold min-h-[1rem] text-emerald-500';
+              btn.disabled = false;
+              btn.innerText = origBtnText;
+              await doSaveDirectly();
+              setTimeout(() => { document.getElementById('modal-add-panel').classList.add('hidden'); }, 600);
+          }
+
+          function removeLinkedPanel(index) {
+              const confirmMsg = i18n[lang]?.confirm_remove_panel || 'Are you sure you want to remove this panel?';
+              if (!confirm(confirmMsg)) return;
+              if (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) {
+                  window.nahanConfig.linkedPanels.splice(index, 1);
+              }
+              renderLinkedPanels();
               doSaveDirectly();
           }
 
@@ -6905,7 +7261,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                   const data = await res.json();
                   if (data.success && data.updateAvailable) {
                       window._updateData = data;
-                      showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim(), data.latest);
+                      showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'EbiDevSharp/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim(), data.latest);
                   }
                   if (data.success && !data.canDeploy) {
                       const statusEl = document.getElementById('update-deploy-status');
@@ -6941,7 +7297,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
 
               let latestCode = null;
               try {
-                  const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
+                  const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'EbiDevSharp/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
                   if (statusEl) statusEl.textContent = '📥 ' + (lang === 'fa' ? 'در حال دریافت کد از مخزن گیت‌هاب...' : 'Fetching latest code from GitHub...');
                   const fetchRes = await fetch('https://raw.githubusercontent.com/' + repo + '/main/_worker.js');
                   if (!fetchRes.ok) throw new Error('HTTP ' + fetchRes.status);
@@ -7017,7 +7373,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                   window._updateData = { latest: CURRENT_VERSION, updateAvailable: false };
               }
               
-              const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'itsyebekhe/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
+              const repo = (document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'EbiDevSharp/nahan').replace('https://github.com/', '').replace('http://github.com/', '').trim();
               
               showUpdateBanner(repo, CURRENT_VERSION);
               
