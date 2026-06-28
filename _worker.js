@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.5.7.2";
+const CURRENT_VERSION = "2.5.9";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -1492,6 +1492,17 @@ const botI18n = {
         btn_sub_link: "🔗 Subscription Link",
         sub_link_sent: "✅ Subscription link sent!",
         btn_update_usage: "🔄 Update Usage",
+        btn_check_update: "🔄 Check for Updates",
+        msg_checking_update: "🔍 Checking for updates...",
+        msg_update_check_failed: "❌ Failed to check for updates. Please try again later.",
+        msg_no_update: "✅ You are already on the latest version (v{version}).",
+        msg_update_available: "🆕 A new version is available!\n\n📦 Current: v{current}\n✨ Latest: v{latest}",
+        msg_update_no_cf: "⚠️ Update found, but Cloudflare Account ID, API Token, and Worker Name are not configured. Set them in the web panel settings to enable deploying from the bot.",
+        btn_deploy_update: "🚀 Deploy Update",
+        msg_confirm_deploy: "⚠️ Deploy v{latest} to your Worker now? The panel will restart momentarily.",
+        msg_deploying: "🚀 Deploying update... this may take a few seconds.",
+        msg_deploy_success: "✅ Successfully updated to v{version}!",
+        msg_deploy_failed: "❌ Update failed: {error}",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -1581,6 +1592,17 @@ const botI18n = {
         sub_link_sent: "✅ لینک اشتراک ارسال شد!",
         btn_update_usage: "🔄 بروزرسانی مصرف",
 	add_panel: "افزودن پنل",
+        btn_check_update: "🔄 بررسی بروزرسانی",
+        msg_checking_update: "🔍 در حال بررسی بروزرسانی...",
+        msg_update_check_failed: "❌ بررسی بروزرسانی ناموفق بود. لطفاً بعداً دوباره تلاش کنید.",
+        msg_no_update: "✅ شما در حال استفاده از آخرین نسخه هستید (v{version}).",
+        msg_update_available: "🆕 نسخه جدیدی موجود است!\n\n📦 نسخه فعلی: v{current}\n✨ آخرین نسخه: v{latest}",
+        msg_update_no_cf: "⚠️ بروزرسانی موجود است، اما شناسه اکانت کلودفلر، توکن API و نام ورکر تنظیم نشده‌اند. برای فعال‌سازی نصب از طریق ربات، آن‌ها را در تنظیمات پنل تحت وب وارد کنید.",
+        btn_deploy_update: "🚀 نصب بروزرسانی",
+        msg_confirm_deploy: "⚠️ آیا از نصب نسخه v{latest} روی ورکر خود اطمینان دارید؟ پنل برای لحظاتی ریستارت می‌شود.",
+        msg_deploying: "🚀 در حال نصب بروزرسانی... ممکن است چند ثانیه طول بکشد.",
+        msg_deploy_success: "✅ با موفقیت به نسخه v{version} بروزرسانی شد!",
+        msg_deploy_failed: "❌ بروزرسانی ناموفق بود: {error}",
     }
 };
 
@@ -1780,6 +1802,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else {
                     inline_keyboard.push([
                         { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
+                    ]);
+                }
+                if (isLocal) {
+                    inline_keyboard.push([
+                        { text: `${t("btn_check_update")}`, callback_data: "sys_check_update" }
                     ]);
                 }
             }
@@ -2149,6 +2176,90 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
+
+                } else if (data === "sys_check_update") {
+                    await sendOrEdit(chatId, t("msg_checking_update"), { inline_keyboard: [] }, messageId);
+                    const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan").replace(/https?:\/\/github\.com\//, '').trim();
+                    let remoteVer = null;
+                    try {
+                        const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/version`);
+                        if (res.ok) {
+                            const txt = (await res.text()).trim();
+                            if (txt && txt.length <= 15) remoteVer = txt;
+                        }
+                    } catch(e) {}
+                    if (!remoteVer) {
+                        try {
+                            const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                            if (res.ok) {
+                                const code = await res.text();
+                                const match = code.match(/const\s+CURRENT_VERSION\s*=\s*["']([^"']+)["']/);
+                                if (match) remoteVer = match[1];
+                            }
+                        } catch(e) {}
+                    }
+                    if (!remoteVer) {
+                        await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        return new Response("OK", { status: 200 });
+                    }
+                    const updateAvailable = cmpVersions(CURRENT_VERSION, remoteVer) < 0;
+                    if (!updateAvailable) {
+                        const text = t("msg_no_update").replace("{version}", CURRENT_VERSION);
+                        await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        return new Response("OK", { status: 200 });
+                    }
+                    const hasCredentials = !!(sysConfig.cfAccountId && sysConfig.cfApiToken && sysConfig.cfWorkerName);
+                    const text = t("msg_update_available").replace("{current}", CURRENT_VERSION).replace("{latest}", remoteVer);
+                    if (!hasCredentials) {
+                        await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        return new Response("OK", { status: 200 });
+                    }
+                    const kb = {
+                        inline_keyboard: [
+                            [{ text: t("btn_deploy_update"), callback_data: `sys_deploy_confirm:${remoteVer}` }],
+                            [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                        ]
+                    };
+                    await sendOrEdit(chatId, text, kb, messageId);
+
+                } else if (data.startsWith("sys_deploy_confirm:")) {
+                    const latestVer = data.replace("sys_deploy_confirm:", "");
+                    const text = t("msg_confirm_deploy").replace("{latest}", latestVer);
+                    const kb = {
+                        inline_keyboard: [
+                            [
+                                { text: t("btn_deploy_update"), callback_data: `sys_deploy_run:${latestVer}` },
+                                { text: t("btn_cancel"), callback_data: "main_menu" }
+                            ]
+                        ]
+                    };
+                    await sendOrEdit(chatId, text, kb, messageId);
+
+                } else if (data.startsWith("sys_deploy_run:")) {
+                    await sendOrEdit(chatId, t("msg_deploying"), { inline_keyboard: [] }, messageId);
+                    const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan").replace(/https?:\/\/github\.com\//, '').trim();
+                    let deployResultText;
+                    try {
+                        const codeRes = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                        if (!codeRes.ok) throw new Error(`HTTP ${codeRes.status}`);
+                        const newCode = await codeRes.text();
+                        const versionMatch = newCode.match(/const\s+CURRENT_VERSION\s*=\s*["']([^"']+)["']/);
+                        const newVersion = versionMatch ? versionMatch[1] : "unknown";
+                        const deployRes = await deployWorkerToCloudflare(sysConfig.cfAccountId, sysConfig.cfApiToken, sysConfig.cfWorkerName, newCode);
+                        const deployResult = await deployRes.json();
+                        if (deployResult.success) {
+                            ctx?.waitUntil(logActivity(env, "Panel Updated", `v${CURRENT_VERSION} → v${newVersion} (via bot)`).catch(()=>{}));
+                            deployResultText = t("msg_deploy_success").replace("{version}", newVersion);
+                        } else {
+                            const errMsg = deployResult.errors?.[0]?.message || "Unknown API error";
+                            deployResultText = t("msg_deploy_failed").replace("{error}", errMsg);
+                        }
+                    } catch(e) {
+                        deployResultText = t("msg_deploy_failed").replace("{error}", e.message);
+                    }
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, deployResultText, kb, messageId);
+
                 } else if (data === "sys_dashboard") {
                     let users, activeCount, pausedCount, expiredCount, autoDisabledCount;
                     if (isRemotePanel) {
