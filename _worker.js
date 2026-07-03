@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.6.1";
+const CURRENT_VERSION = "2.6.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -69,6 +69,23 @@ const SYSTEM_DEFAULTS = {
 let sysConfig = { ...SYSTEM_DEFAULTS };
 let isolateStartTime = Date.now();
 let activeConnections = 0;
+// Per-user concurrent connection tracking (best-effort, per-isolate)
+const userActiveConns = new Map();
+function registerConnectionSlot(uuid, maxConn, webSocket) {
+    const cur = userActiveConns.get(uuid) || 0;
+    if (maxConn && maxConn > 0 && cur >= maxConn) return false;
+    userActiveConns.set(uuid, cur + 1);
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        const c = (userActiveConns.get(uuid) || 1) - 1;
+        if (c <= 0) userActiveConns.delete(uuid); else userActiveConns.set(uuid, c);
+    };
+    webSocket.addEventListener('close', release);
+    webSocket.addEventListener('error', release);
+    return true;
+}
 let uuidUsage = new Map();
 let activeDeviceId = "";
 
@@ -1032,7 +1049,7 @@ async function handleUsersApi(request, env, ctx) {
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, maxConnections, proxyIp, cleanIp, userMode, userPorts } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
@@ -1043,6 +1060,7 @@ async function handleUsersApi(request, env, ctx) {
                 expiryMs: expiryDays ? Date.now() + parseInt(expiryDays) * 86400000 : null,
                 notes: notes || "",
                 maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
+                maxConnections: maxConnections ? parseInt(maxConnections) : null,
                 proxyIp: proxyIp || null,
 cleanIp: cleanIp || null,
                 userMode: userMode || null,
@@ -1069,6 +1087,7 @@ cleanIp: cleanIp || null,
             if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
             if (body.notes !== undefined) u.notes = body.notes;
             if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
+            if (body.maxConnections !== undefined) u.maxConnections = body.maxConnections ? parseInt(body.maxConnections) : null;
             if (body.proxyIp !== undefined) u.proxyIp = body.proxyIp;
 if (body.cleanIp !== undefined) u.cleanIp = body.cleanIp;
             if (body.userMode !== undefined) u.userMode = body.userMode;
@@ -1489,6 +1508,7 @@ const botI18n = {
         extend_expiry: "📅 Extend Expiry",
         notes: "📝 Notes",
         device_limit: "📱 Config Limit",
+        conn_limit: "🔌 Connection Limit",
         msg_enter_search: "🔍 Send a username, UUID, or subscription to search:",
         msg_enter_notes: "📝 Send notes for this user:",
         msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
@@ -1588,6 +1608,7 @@ const botI18n = {
         extend_expiry: "📅 تمدید انقضا",
         notes: "📝 یادداشت‌ها",
         device_limit: "📱 محدودیت کانفیگ",
+        conn_limit: "🔌 محدودیت کانکشن هم‌زمان",
         msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
         msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
         msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
@@ -1946,6 +1967,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const statusText = u.isPaused ? t("paused") : (isExp ? t("dash_expired") : t("active"));
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
             const maxCfgTxt = u.maxConfigs || t("unlimited");
+            const maxConnTxt = u.maxConnections || t("unlimited");
             const notesTxt = u.notes || t("lbl_none");
 
             let text = `👤 **${t("sub_info")}**\n`;
@@ -1958,6 +1980,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
             text += `⏳ **${t("days")}**: ${daysLeft}\n`;
             text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
+            text += `🔌 **${t("conn_limit")}**: ${maxConnTxt}\n`;
             text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `🔗 **${t("lbl_subscription")}:**\n\`${subSync}\``;
@@ -3032,10 +3055,13 @@ async function startDataPipe(webSocket, env, ctx) {
 
             // Validate UUID
             let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
-            let validUUIDs = getAllProfiles().map(p => p.id.replace(/-/g, '').toLowerCase());
-            if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
-            
+            let allProfilesAlpha = getAllProfiles();
+            let matchedProfileAlpha = allProfilesAlpha.find(p => p.id.replace(/-/g, '').toLowerCase() === clientHash);
+            if (!matchedProfileAlpha) return false; // DROP IF INVALID PROFILE
+            if (!registerConnectionSlot(clientHash, matchedProfileAlpha.maxConnections, webSocket)) return false; // DROP IF CONNECTION LIMIT REACHED
+
             activeClientHash = clientHash;
+            activeProfile = matchedProfileAlpha;
             trackUsage(activeClientHash, 0, env, ctx);
 
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
@@ -3060,8 +3086,10 @@ async function startDataPipe(webSocket, env, ctx) {
             let clientHashHex = new TextDecoder().decode(view.slice(0, ePos));
             let validProfile = getAllProfiles().find(p => getTrojanHash(p.id) === clientHashHex);
             if (!validProfile) return false;
-            
+
             activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
+            if (!registerConnectionSlot(activeClientHash, validProfile.maxConnections, webSocket)) return false; // DROP IF CONNECTION LIMIT REACHED
+            activeProfile = validProfile;
             trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -3231,7 +3259,7 @@ function getAllProfiles(targetSub = null) {
                 if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, accessHourFrom: u.accessHourFrom || null, accessHourTo: u.accessHourTo || null });
+                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, maxConnections: u.maxConnections || null, accessHourFrom: u.accessHourFrom || null, accessHourTo: u.accessHourTo || null });
             }
         });
     }
@@ -4827,8 +4855,14 @@ function getDashboardUI(hasDB) {
                       </div>
   
                       <!-- SETTINGS VIEW -->
-                      <div id="view-settings" class="hidden">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
+                      <div id="view-settings" class="hidden space-y-4">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-b1')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🌐</span><span data-i18n="acc_b1_title">Protocol & Ports</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0 rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-b1" class="acc-body px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_proto">Primary Display Mode</label>
                                   <select id="cfg-proto" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
@@ -4921,6 +4955,16 @@ function getDashboardUI(hasDB) {
                                       </div>
                                   </div>
                               </div>
+                              </div>
+                              </div>
+                          </div>
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-b2')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🔐</span><span data-i18n="acc_b2_title">Identity & Security</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-b2" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 md:col-span-2">
                                   <div class="flex justify-between items-center">
                                       <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
@@ -4939,6 +4983,16 @@ function getDashboardUI(hasDB) {
                                       <button type="button" onclick="const n=document.getElementById('cfg-pass');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
                                   </div>
                               </div>
+                              </div>
+                              </div>
+                          </div>
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-b3')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🔄</span><span data-i18n="acc_b3_title">Update & Access</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-b3" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 md:col-span-2">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_github_repo">GitHub Update Repository</label>
                                   <input type="text" id="cfg-github-repo" placeholder="EbiDevSharp/nahan" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
@@ -4958,9 +5012,16 @@ function getDashboardUI(hasDB) {
                                   <input type="text" id="cfg-custom-panel-url" placeholder="e.g. custom.domain.com or https://custom.domain.com" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                   <p class="text-xs text-slate-500 mt-1 ms-1" data-i18n="desc_custom_panel_url">Optionally specify a custom domain/URL to be used for subscription/sync links. If empty, the default Worker address will be used.</p>
                               </div>
-  
-                              <!-- Import/Export Config Area -->
-                              <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
+                              </div>
+                              </div>
+                          </div>
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-b4')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">💾</span><span data-i18n="acc_b4_title">Backup & Restore</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-b4" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                                   <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
                                   <div class="flex flex-col sm:flex-row gap-4">
                                       <button onclick="exportConfig()" class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
@@ -4972,13 +5033,18 @@ function getDashboardUI(hasDB) {
                                       </label>
                                   </div>
                               </div>
+                              </div>
                           </div>
                       </div>
   
                       <!-- ADVANCED VIEW -->
                       <div id="view-advanced" class="hidden space-y-6">
-                          <!-- Multi Clean IP Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mb-4">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a1')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🧹</span><span data-i18n="acc_a1_title">Clean IPs (Multi-Generator)</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0 rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a1" class="acc-body px-6 pb-6">
                               <div class="flex items-center justify-between mb-4">
                                   <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</h3>
                                   <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
@@ -4989,10 +5055,14 @@ function getDashboardUI(hasDB) {
                                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
                                   Auto-Resolve CDN & Clean IPs
                               </button>
+                              </div>
                           </div>
-                          
-                          <!-- Slave Nodes Section -->
-                          <div class="bg-indigo-50 dark:bg-indigo-900/20 rounded-3xl p-6 shadow-sm border border-indigo-100 dark:border-indigo-900/50 relative overflow-hidden">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a2')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🕸️</span><span data-i18n="acc_a2_title">Slave Worker Nodes (Cluster)</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a2" class="acc-body hidden px-6 pb-6">
                               <div class="absolute top-0 end-0 bg-indigo-100 dark:bg-indigo-900/40 px-3 py-1 text-[10px] font-bold text-indigo-500 dark:text-indigo-400 rounded-bl-xl">CLUSTER</div>
                               <div class="flex items-center justify-between mb-2">
                                   <h3 class="text-sm uppercase font-black text-indigo-800 dark:text-indigo-300 tracking-wider flex items-center">
@@ -5017,9 +5087,15 @@ function getDashboardUI(hasDB) {
                                   </div>
                               </label>
                               </div>
+                              </div>
                           </div>
-  
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a3')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🛡️</span><span data-i18n="acc_a3_title">TLS & Network</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a3" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fp">TLS Signature</label>
                                   <select id="cfg-fp" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
@@ -5042,10 +5118,16 @@ function getDashboardUI(hasDB) {
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_relay">Proxy IPs (Comma/Newline separated)</label>
                                   <textarea id="cfg-relay" rows="3" placeholder="104.20.0.1\nproxyip.cmliussss.net" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               </div>
+                              </div>
+                              </div>
                           </div>
-  
-                          <!-- Custom Name Strategy -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a4')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🏷️</span><span data-i18n="acc_a4_title">Config Naming</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a4" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_strategy">Configuration Name Strategy</label>
                                   <input type="text" id="cfg-name-strategy" placeholder="{FLAG} {PROTOCOL}-{USER}-{PORT}" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
@@ -5057,9 +5139,16 @@ function getDashboardUI(hasDB) {
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_prefix">Custom Name Prefix</label>
                                   <input type="text" id="cfg-name-prefix" placeholder="Core" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
+                              </div>
+                              </div>
                           </div>
-  
-                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a5')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">⚙️</span><span data-i18n="acc_a5_title">Toggles & Switches</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a5" class="acc-body hidden px-6 pb-6 space-y-4">
+                              <div class="flex flex-col sm:flex-row gap-4">
                               <!-- TCP Fast Open Toggle -->
                               <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
                                   <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_tfo">TCP Fast Open</span>
@@ -5076,9 +5165,8 @@ function getDashboardUI(hasDB) {
                                       <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
                                   </div>
                               </label>
-                          </div>
-
-                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder mt-6">
+                              </div>
+                              <div class="flex flex-col sm:flex-row gap-4">
                               <!-- Silent Alert Toggle -->
                               <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
                                   <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_silent">Silent UI Alerts</span>
@@ -5095,10 +5183,16 @@ function getDashboardUI(hasDB) {
                                       <div class="w-11 h-6 bg-red-200 dark:bg-red-900/50 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-red-500"></div>
                                   </div>
                               </label>
+                              </div>
+                              </div>
                           </div>
-
-                          <!-- Telegram Bot Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a6')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🤖</span><span data-i18n="acc_a6_title">Telegram Bot</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a6" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_token">Token Bot</label>
                                   <div class="relative">
@@ -5116,20 +5210,30 @@ function getDashboardUI(hasDB) {
                                   <p class="text-xs text-slate-400 mt-1" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
                               </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
+                              </div>
+                              </div>
                           </div>
-
-                          <!-- Linked Panels Section -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mt-6">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a7')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🔗</span><span data-i18n="acc_a7_title">Linked Panels</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a7" class="acc-body hidden px-6 pb-6">
                               <div class="flex items-center justify-between gap-3 mb-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_linked_panels">Linked Panels</label>
                                   <button type="button" onclick="openAddPanelModal()" class="shrink-0 px-3 py-1.5 rounded-xl bg-primary text-white text-xs font-bold flex items-center gap-1">➕ <span data-i18n="btn_add_panel">Add Panel</span></button>
                               </div>
                               <p class="text-xs text-slate-400 mb-3" data-i18n="desc_linked_panels">Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.</p>
                               <div id="linked-panels-list" class="space-y-2"></div>
+                              </div>
                           </div>
-                          
-                          <!-- Cloudflare Usage Analytics -->
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-a8')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">📊</span><span data-i18n="acc_a8_title">Cloudflare Analytics</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-a8" class="acc-body hidden px-6 pb-6">
+                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_cf_acc">CF Account ID</label>
                                   <input type="text" id="cfg-cf-acc" placeholder="a1b2c3d4e5f6..." class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
@@ -5176,6 +5280,8 @@ function getDashboardUI(hasDB) {
                                           </ol>
                                       </div>
                                   </div>
+                              </div>
+                              </div>
                               </div>
                           </div>
                       </div>
@@ -5341,6 +5447,10 @@ function getDashboardUI(hasDB) {
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
                                           <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
+                                          <input type="number" min="0" id="add-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
                                   </div>
                               </div>
                               <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
@@ -5447,6 +5557,10 @@ function getDashboardUI(hasDB) {
                                       <div>
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
                                           <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
+                                          <input type="number" min="0" id="edit-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
                                   </div>
                               </div>
@@ -5700,6 +5814,10 @@ function getDashboardUI(hasDB) {
                   lbl_u_Protocol:"Protocol Mode (Leave empty to use global setting)",
                   lbl_u_ports:"Custom Ports (Optional - overrides global ports, comma separated e.g. 443,80",
                   lbl_u_max_config:"Max Configs",
+                  lbl_u_max_conn:"Max Concurrent Connections",
+                  acc_b1_title:"Protocol & Ports", acc_b2_title:"Identity & Security", acc_b3_title:"Update & Access", acc_b4_title:"Backup & Restore",
+                  acc_a1_title:"Clean IPs (Multi-Generator)", acc_a2_title:"Slave Worker Nodes (Cluster)", acc_a3_title:"TLS & Network", acc_a4_title:"Config Naming",
+                  acc_a5_title:"Toggles & Switches", acc_a6_title:"Telegram Bot", acc_a7_title:"Linked Panels", acc_a8_title:"Cloudflare Analytics",
                   login_password:"Password",
                   lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
                   lbl_custom_panel_url:"Custom Panel URL / Subscription Domain",
@@ -5770,6 +5888,10 @@ function getDashboardUI(hasDB) {
                   lbl_u_Protocol:"نوع پروتکل(خالی بر اساس تنظیمات کلی)",
                   lbl_u_ports:"نوع پورت",
                   lbl_u_max_config:"حداکثر تعداد کانفیگ",
+                  lbl_u_max_conn:"حداکثر تعداد کانکشن هم‌زمان",
+                  acc_b1_title:"پروتکل و پورت‌ها", acc_b2_title:"هویت و امنیت", acc_b3_title:"بروزرسانی و دسترسی", acc_b4_title:"پشتیبان‌گیری و بازیابی",
+                  acc_a1_title:"آی‌پی‌های پاک (چند سازنده)", acc_a2_title:"گره‌های برده (کلاستر)", acc_a3_title:"شبکه و امنیت TLS", acc_a4_title:"نام‌گذاری کانفیگ",
+                  acc_a5_title:"سوییچ‌های عملکردی", acc_a6_title:"ربات تلگرام", acc_a7_title:"پنل‌های متصل", acc_a8_title:"آنالیتیکس کلودفلر",
                   login_password:"رمز ورود",
                   lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
                   v_pop_title: "اطلاعیه تعمیرات", v_pop_whatsnew: "ویژگی‌های جدید", v_pop_headline: "امکانات جدید و بهبودها",
@@ -6140,6 +6262,15 @@ function getDashboardUI(hasDB) {
               if(activeTab) document.getElementById('view-title').innerText = activeTab.innerText;
           }
   
+          function toggleAccordion(id) {
+              const body = document.getElementById(id);
+              if (!body) return;
+              const btn = body.previousElementSibling;
+              const chevron = btn ? btn.querySelector('.acc-chevron') : null;
+              body.classList.toggle('hidden');
+              if (chevron) chevron.classList.toggle('rotate-180');
+          }
+
           function switchTab(tab) {
             ['overview','info','network','settings','advanced','logs','users'].forEach(t => {
                   const view = document.getElementById('view-'+t);
@@ -6475,7 +6606,7 @@ function getDashboardUI(hasDB) {
 
                       
             
-                     window.toggleAccordion = function(btn) 
+                     window.toggleAccordionCards = function(btn) 
                         {
                             const card = btn.closest('[data-accordion]');
                             const content = card.querySelector('[data-accordion-content]');
@@ -6503,7 +6634,7 @@ function getDashboardUI(hasDB) {
                             const isDef = p.name === 'Default';
                             let html = \`<div class="bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative mb-4 break-inside-avoid inline-block w-full" data-accordion>
     <div class="absolute top-0 end-0 w-32 h-32 bg-primary/5 rounded-bl-[100px] -z-10"></div>
-    <button onclick="toggleAccordion(this)" class="w-full flex items-center justify-between p-5 md:p-6">
+    <button onclick="toggleAccordionCards(this)" class="w-full flex items-center justify-between p-5 md:p-6">
         <h3 class="text-lg font-bold text-slate-800 dark:text-white flex items-center">
             <svg class="w-5 h-5 me-2 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
             \${p.name}
@@ -6811,6 +6942,7 @@ function getDashboardUI(hasDB) {
                               \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'VLESS+Trojan'}</span>\` : ''}
                               \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-300">🔌 \${u.userPorts}</span>\` : ''}
                               \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-600 dark:text-amber-300">max \${u.maxConfigs} cfgs</span>\` : ''}
+                              \${u.maxConnections ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-fuchsia-100 dark:bg-fuchsia-900/40 text-fuchsia-600 dark:text-fuchsia-300">🔌 max \${u.maxConnections} conn</span>\` : ''}
                               \${u.accessHourFrom && u.accessHourTo ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/40 text-sky-600 dark:text-sky-300">🕐 \${u.accessHourFrom}-\${u.accessHourTo}</span>\` : ''}
                           </div>
                           \${disableInfoHtml}
@@ -7165,9 +7297,11 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               const userMode = readModeFromCheckboxes('add-mode-cb');
               const userPorts = readPortsFromCheckboxes('add-user-ports-wrap');
               let maxConfigs = document.getElementById('add-user-max-configs').value;
+              let maxConnections = document.getElementById('add-user-max-connections').value;
               let accessHourFrom=document.getElementById('add-user-access-from').value;
               let accessHourTo=document.getElementById('add-user-access-to').value;
               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
+              maxConnections = maxConnections ? parseInt(maxConnections) : null;
               
               if(!name) {
                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
@@ -7201,6 +7335,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                    userMode: userMode,
                    userPorts: userPorts,
                    maxConfigs: maxConfigs,
+                   maxConnections: maxConnections,
                    accessHourFrom:accessHourFrom,
                    accessHourTo: accessHourTo,
                    createdAt: Date.now()
@@ -7216,6 +7351,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               document.getElementById('add-user-daily-reqs').value = '';
               document.getElementById('add-user-days').value = '';
               document.getElementById('add-user-max-configs').value = '';
+              document.getElementById('add-user-max-connections').value = '';
               document.getElementById('add-user-access-from').value = '';
               document.getElementById('add-user-access-to').value = '';
               
@@ -7261,6 +7397,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               document.getElementById('edit-user-custom-name').value = u.customName || '';
               
               document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
+              document.getElementById('edit-user-max-connections').value = u.maxConnections || '';
               document.getElementById('edit-user-access-from').value=u.accessHourFrom || '';
               document.getElementById('edit-user-access-to').value=u.accessHourTo || '';
              
@@ -7306,9 +7443,11 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               const userMode = readModeFromCheckboxes('edit-mode-cb');
               const userPorts = readPortsFromCheckboxes('edit-user-ports-wrap');
               let maxConfigs = document.getElementById('edit-user-max-configs').value;
+              let maxConnections = document.getElementById('edit-user-max-connections').value;
               let accessHourFrom=document.getElementById('edit-user-access-from').value;
               let accessHourTo=document.getElementById('edit-user-access-to').value;
               maxConfigs = maxConfigs ? parseInt(maxConfigs) : null;
+              maxConnections = maxConnections ? parseInt(maxConnections) : null;
               
               
               if(!name) {
@@ -7339,6 +7478,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               u.userMode = userMode;
               u.userPorts = userPorts;
               u.maxConfigs = maxConfigs;
+              u.maxConnections = maxConnections;
               u.accessHourFrom=accessHourFrom;
               u.accessHourTo=accessHourTo;
               
