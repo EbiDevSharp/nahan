@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.6.0";
+const CURRENT_VERSION = "2.6.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -857,7 +857,7 @@ async function sendTelegramMessage(request, type, hostName) {
         hour: '2-digit', minute: '2-digit', second: '2-digit'
     }).format(d);
 
-    const text = `📌 نوع: ${escMd(type)}\n` +
+    let text = `📌 نوع: ${escMd(type)}\n` +
         `🌐 IP: ${escMd(ip)}\n` +
         `📍 موقعیت: ${escMd(country)} ${escMd(city)}\n` +
         `🏢 ASN: AS${escMd(asn)} ${escMd(asOrg)}\n` +
@@ -871,23 +871,57 @@ async function sendTelegramMessage(request, type, hostName) {
     const langCode = sysConfig.tgBotLang || "fa";
     const locT = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
     const isPaused = sysConfig.isPaused || false;
+    const statusEmoji = isPaused ? "🔴" : "🟢";
     const panelUrl = `https://${h}/${encodeURI(sysConfig.apiRoute)}/dash`;
     const subUrl = `https://${h}/${sysConfig.apiRoute}`;
+    const usersList = sysConfig.users || [];
+    const activeCount = usersList.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+    const pausedCount = usersList.filter(u => u.isPaused && !u.disabledReason).length;
+    const autoDisabledCount = usersList.filter(u => u.isPaused && u.disabledReason).length;
+    const panelName = sysConfig.name || "Main Panel";
+
+    text += `\n\n━━━━━━━━━━━━━━━━\n` +
+        `📌 **${locT("current_panel")}**: 🏠 ${panelName}\n` +
+        `⚡ **${locT("status")}**: ${isPaused ? locT("paused") : locT("active")} ${statusEmoji}\n` +
+        `👥 **${locT("users")}**: ${usersList.length} (${activeCount} ${locT("count_active")}, ${pausedCount} ${locT("count_paused")}, ${autoDisabledCount} ${locT("count_disabled")})\n` +
+        `━━━━━━━━━━━━━━━━`;
+
+    /** @type {any} */
     const inline_keyboard = [
+        [
+            { text: `👥 ${locT("users")}`, callback_data: "subs_list:0" },
+            { text: `🔍 ${locT("search")}`, callback_data: "sub_search_init" }
+        ],
         [
             { text: `📊 ${locT("dashboard")}`, callback_data: "sys_dashboard" },
             { text: `📈 ${locT("statistics")}`, callback_data: "sys_stats" }
         ],
         [
-            { text: `🔗 ${locT("btn_sub_link")}`, callback_data: "get_sub_link" },
-            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" }
+            { text: `🔗 ${locT("btn_sub_link")}`, callback_data: "get_sub_link" }
+        ],
+        [
+            { text: `🚫 ${locT("disabled_users")}`, callback_data: "subs_disabled:0" }
+        ],
+        [
+            { text: `🔄 ${locT("switch_panel")}`, callback_data: "switch_panel" },
+            { text: `➕ ${locT("add_panel")}`, callback_data: "add_panel_init" }
+        ],
+        [
+            { text: `${locT("btn_check_update")}`, callback_data: "sys_check_update" }
         ],
         [
             { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
             { text: isPaused ? locT("btn_resume") : locT("btn_pause"), callback_data: "sys_toggle_status" }
         ],
         [
-            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } }
+            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } },
+            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" }
+        ],
+        [
+            { text: `🚨 ${locT("panic")}`, callback_data: "sys_panic_init" }
+        ],
+        [
+            { text: `📱 Mini App`, web_app: { url: panelUrl } }
         ]
     ];
 
