@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.6.2";
+const CURRENT_VERSION = "2.6.3";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -133,7 +133,11 @@ async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
 
 async function d1Init(env) {
     if(env.IOT_DB && !env.IOT_DB_INITIALIZED) {
-        try { await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run(); env.IOT_DB_INITIALIZED = true; } catch(e) { env.IOT_DB_INITIALIZED = true; }
+        try {
+            await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run();
+            await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS active_conns (conn_id TEXT PRIMARY KEY, uuid TEXT, label TEXT, connected_at INTEGER, last_seen INTEGER)").run();
+            env.IOT_DB_INITIALIZED = true;
+        } catch(e) { env.IOT_DB_INITIALIZED = true; }
     }
 }
 async function d1Get(env, key) {
@@ -153,6 +157,45 @@ async function cachedD1Put(env, key, value) {
     if (key === "sys_config") sysConfigCacheTime = 0;
     else if (key === "sys_usage") sysUsageCacheTime = 0;
     else if (key === "backup_ip") backupIpCacheTime = 0;
+}
+
+// --- Cross-isolate active connection tracking (D1-backed) ---
+// A Worker isolate's in-memory counters (activeConnections/userActiveConns) only reflect
+// connections handled by THAT isolate. Since the admin panel's /api/stats request can land
+// on a completely different isolate than the ones proxying live traffic, the in-memory
+// counter alone is unreliable for display. These helpers persist connection state to D1
+// so it can be read back reliably from any isolate.
+async function d1RegisterConn(env, connId, uuid, label) {
+    if (!env.IOT_DB) return;
+    await d1Init(env);
+    try {
+        const now = Date.now();
+        await env.IOT_DB.prepare(
+            "INSERT INTO active_conns (conn_id, uuid, label, connected_at, last_seen) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conn_id) DO UPDATE SET last_seen=excluded.last_seen"
+        ).bind(connId, uuid, label || "", now, now).run();
+    } catch (e) {}
+}
+async function d1TouchConn(env, connId) {
+    if (!env.IOT_DB) return;
+    try { await env.IOT_DB.prepare("UPDATE active_conns SET last_seen = ? WHERE conn_id = ?").bind(Date.now(), connId).run(); } catch (e) {}
+}
+async function d1RemoveConn(env, connId) {
+    if (!env.IOT_DB) return;
+    try { await env.IOT_DB.prepare("DELETE FROM active_conns WHERE conn_id = ?").bind(connId).run(); } catch (e) {}
+}
+// Heartbeats are written every CONN_HEARTBEAT_MS; anything older than STALE_MS is considered
+// dead (isolate evicted without firing close/error) and is pruned on read.
+const CONN_HEARTBEAT_MS = 45000;
+const CONN_STALE_MS = 120000;
+async function d1GetActiveConns(env) {
+    if (!env.IOT_DB) return [];
+    await d1Init(env);
+    try {
+        const cutoff = Date.now() - CONN_STALE_MS;
+        await env.IOT_DB.prepare("DELETE FROM active_conns WHERE last_seen < ?").bind(cutoff).run();
+        const { results } = await env.IOT_DB.prepare("SELECT conn_id, uuid, label, connected_at, last_seen FROM active_conns ORDER BY connected_at DESC").all();
+        return results || [];
+    } catch (e) { return []; }
 }
 
 function sha224Hex(m) {
@@ -1169,12 +1212,28 @@ async function handleStatsApi(request, env) {
 
         const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
 
+        // Cross-isolate connection list (D1-backed); falls back to the local in-isolate
+        // counter only when no database is bound.
+        const liveConns = env.IOT_DB ? await d1GetActiveConns(env) : null;
+        const connectionsList = (liveConns || []).map(c => {
+            const user = users.find(u => u.id.replace(/-/g, '').toLowerCase() === c.uuid);
+            return { uuid: c.uuid, name: (user && user.name) || c.label || c.uuid, connectedAt: c.connected_at };
+        });
+        const liveActiveConnections = liveConns !== null ? connectionsList.length : activeConnections;
+
+        // Cloudflare Workers request count for today, via the stored account/API token.
+        let cfRequestsToday = null;
+        const cfHasCreds = !!(sysConfig.cfAccountId && sysConfig.cfApiToken);
+        if (cfHasCreds) cfRequestsToday = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
+
         return new Response(JSON.stringify({
             success: true,
             stats: {
                 users: { total: totalUsers, active: activeUsers, paused: pausedUsers, expired: expiredUsers, autoDisabled: autoDisabledUsers },
                 traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
-                system: { uptimeSeconds: upSeconds, activeConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false }
+                system: { uptimeSeconds: upSeconds, activeConnections: liveActiveConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false },
+                connections: connectionsList,
+                cloudflare: { hasCredentials: cfHasCreds, requestsToday: cfRequestsToday }
             }
         }), { headers: { "Content-Type": "application/json" } });
     } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
@@ -3030,6 +3089,15 @@ async function startDataPipe(webSocket, env, ctx) {
     activeConnections++;
     webSocket.addEventListener('close', () => activeConnections--);
     webSocket.addEventListener('error', () => activeConnections--);
+    const connId = crypto.randomUUID();
+    let hbTimer = null;
+    function trackConnStart(uuid, label) {
+        ctx?.waitUntil(d1RegisterConn(env, connId, uuid, label).catch(() => {}));
+        hbTimer = setInterval(() => { ctx?.waitUntil(d1TouchConn(env, connId).catch(() => {})); }, CONN_HEARTBEAT_MS);
+        const stop = () => { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } ctx?.waitUntil(d1RemoveConn(env, connId).catch(() => {})); };
+        webSocket.addEventListener('close', stop);
+        webSocket.addEventListener('error', stop);
+    }
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
     let activeClientHash = null;
     webSocket.addEventListener("message", (event) => {
@@ -3062,6 +3130,7 @@ async function startDataPipe(webSocket, env, ctx) {
 
             activeClientHash = clientHash;
             activeProfile = matchedProfileAlpha;
+            trackConnStart(clientHash, matchedProfileAlpha.name || "");
             trackUsage(activeClientHash, 0, env, ctx);
 
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
@@ -3090,6 +3159,7 @@ async function startDataPipe(webSocket, env, ctx) {
             activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
             if (!registerConnectionSlot(activeClientHash, validProfile.maxConnections, webSocket)) return false; // DROP IF CONNECTION LIMIT REACHED
             activeProfile = validProfile;
+            trackConnStart(activeClientHash, validProfile.name || "");
             trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -4717,7 +4787,7 @@ function getDashboardUI(hasDB) {
                           </div>
 
                           <!-- Traffic & System Cards -->
-                          <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4">
+                          <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-5 gap-2 md:gap-4">
                               <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
                                   <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
                                       <div class="p-1.5 md:p-2.5 bg-violet-500/10 text-violet-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg></div>
@@ -4747,6 +4817,25 @@ function getDashboardUI(hasDB) {
                                       <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_system">System</span>
                                   </div>
                                   <p id="ov-version" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
+                              </div>
+                              <div class="bg-white dark:bg-darkcard rounded-xl md:rounded-2xl p-3 md:p-5 shadow-sm border border-slate-200 dark:border-darkborder">
+                                  <div class="flex items-center gap-2 md:gap-3 mb-2 md:mb-3">
+                                      <div class="p-1.5 md:p-2.5 bg-orange-500/10 text-orange-500 rounded-lg md:rounded-xl"><svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 001.7-9.7 5.5 5.5 0 00-10.2-2A4.5 4.5 0 003 15z"></path></svg></div>
+                                      <span class="text-[10px] md:text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="ov_cf_requests">Worker Requests (Today)</span>
+                                  </div>
+                                  <p id="ov-cf-requests" class="text-base md:text-xl font-black text-slate-800 dark:text-white">-</p>
+                                  <p id="ov-cf-requests-note" class="text-[9px] md:text-[10px] text-slate-400 mt-0.5 md:mt-1"></p>
+                              </div>
+                          </div>
+
+                          <!-- Currently Connected Users -->
+                          <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="flex items-center justify-between mb-3 md:mb-4">
+                                  <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="ov_connected_now">Connected Now</h3>
+                                  <span id="ov-connected-count-badge" class="text-[10px] md:text-xs font-bold text-primary bg-primary/10 px-2 py-1 rounded-lg">0</span>
+                              </div>
+                              <div id="ov-connected-list" class="space-y-1.5 md:space-y-2.5">
+                                  <p class="text-sm text-slate-400 text-center py-6" data-i18n="ov_loading">Loading...</p>
                               </div>
                           </div>
 
@@ -5827,6 +5916,7 @@ function getDashboardUI(hasDB) {
                   changelog_added: "Added", changelog_fixed: "Fixed", changelog_improved: "Improved", changelog_changed: "Changed", changelog_note: "Important Notes",
                   ov_total_users: "Total Users", ov_active_users: "Active", ov_paused_users: "Paused", ov_auto_disabled: "Auto-Disabled", ov_expired_users: "Expired",
                   ov_total_traffic: "Total Traffic", ov_today_traffic: "Today's Traffic", ov_requests: "requests", ov_active_conns: "Active Connections",
+                  ov_cf_requests: "Worker Requests (Today)", ov_connected_now: "Connected Now", ov_no_connections: "No one connected right now.",
                   ov_system: "System", ov_recent_activity: "Recent Activity", ov_view_all: "View All →", ov_loading: "Loading...",
                    ov_quick_actions: "Quick Actions", ov_add_user: "Add User", ov_backup_config: "Backup Config", ov_refresh: "Refresh Statistics", ov_manage_users: "Manage Users",
                    ov_gb_unit: "GB",
@@ -5900,6 +5990,7 @@ function getDashboardUI(hasDB) {
                    changelog_added: "اضافه شده", changelog_fixed: "رفع شده", changelog_improved: "بهبود یافته", changelog_changed: "تغییر یافته", changelog_note: "نکات مهم",
                    ov_total_users: "کل کاربران", ov_active_users: "فعال", ov_paused_users: "متوقف", ov_auto_disabled: "غیرفعال خودکار", ov_expired_users: "منقضی",
                    ov_total_traffic: "ترافیک کل", ov_today_traffic: "ترافیک امروز", ov_requests: "درخواست", ov_active_conns: "اتصالات فعال",
+                   ov_cf_requests: "درخواست‌های ورکر (امروز)", ov_connected_now: "متصل هم‌اکنون", ov_no_connections: "در حال حاضر کسی متصل نیست.",
                    ov_system: "سیستم", ov_recent_activity: "فعالیت‌های اخیر", ov_view_all: "مشاهده همه ←", ov_loading: "در حال بارگذاری...",
                    ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
                    ov_gb_unit: "گیگابایت",
@@ -6338,6 +6429,93 @@ function getDashboardUI(hasDB) {
                     document.getElementById('ov-today-reqs').textContent = s.traffic.dailyRequests.toLocaleString();
                     document.getElementById('ov-active-conns').textContent = s.system.activeConnections;
                     document.getElementById('ov-version').textContent = 'v' + s.system.version;
+
+                    const cfReqEl = document.getElementById('ov-cf-requests');
+                    const cfNoteEl = document.getElementById('ov-cf-requests-note');
+                    if (s.cloudflare && s.cloudflare.hasCredentials) {
+                        cfReqEl.textContent = s.cloudflare.requestsToday !== null ? s.cloudflare.requestsToday.toLocaleString() : '—';
+                        cfNoteEl.textContent = s.cloudflare.requestsToday !== null ? (lang === 'fa' ? 'از API کلودفلر' : 'via Cloudflare API') : (lang === 'fa' ? 'دریافت اطلاعات ناموفق بود' : 'fetch failed');
+                    } else {
+                        cfReqEl.textContent = '—';
+                        cfNoteEl.textContent = lang === 'fa' ? 'شناسه اکانت/توکن تنظیم نشده' : 'Account ID/token not set';
+                    }
+
+                    const connList = document.getElementById('ov-connected-list');
+const connBadge = document.getElementById('ov-connected-count-badge');
+
+const conns = s.connections || [];
+
+// Group connections by user
+const grouped = {};
+
+conns.forEach(c => {
+    const key = c.name || c.uuid || 'Unknown';
+
+    if (!grouped[key]) {
+        grouped[key] = {
+            name: key,
+            uuid: c.uuid,
+            count: 0,
+            connectedAt: c.connectedAt
+        };
+    }
+
+    grouped[key].count++;
+
+    // نگهداری قدیمی‌ترین زمان اتصال
+    if (c.connectedAt) {
+        if (
+            !grouped[key].connectedAt ||
+            new Date(c.connectedAt) < new Date(grouped[key].connectedAt)
+        ) {
+            grouped[key].connectedAt = c.connectedAt;
+        }
+    }
+});
+
+// مرتب‌سازی بر اساس تعداد اتصال
+const users = Object.values(grouped).sort((a, b) => b.count - a.count);
+
+// Badge: تعداد کاربران / تعداد اتصال‌ها
+connBadge.textContent = users.length + ' / ' + conns.length;
+
+if (users.length > 0) {
+    connList.innerHTML = '';
+
+    users.forEach(u => {
+        const since = u.connectedAt
+            ? new Date(u.connectedAt).toLocaleString(
+                  lang === 'fa' ? 'fa-IR' : 'en-US',
+                  { hour12: false }
+              )
+            : '';
+            connList.insertAdjacentHTML('beforeend',
+            '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl">' +
+                '<div class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></div>' +
+                '<div class="flex-1 min-w-0">' +
+                    '<p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' +
+                        u.name +
+                    '</p>' +
+                '</div>' +
+                '<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300 shrink-0">' +
+                    u.count + ' ' + (u.count === 1 ? 'Conn' : 'Conns') +
+                '</span>' +
+                '<span class="text-[10px] font-mono text-slate-400 shrink-0">' +
+                    since +
+                '</span>' +
+            '</div>'
+        );
+        
+    });
+} else {
+    connList.innerHTML =
+        '<p class="text-sm text-slate-400 text-center py-6" data-i18n="ov_no_connections">' +
+        (i18n[lang]?.ov_no_connections || 'No one connected right now.') +
+        '</p>';
+}
+
+
+
                 }
 
                 const actList = document.getElementById('ov-activity-list');
