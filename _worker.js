@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.6.3";
+const CURRENT_VERSION = "2.6.6";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -136,6 +136,7 @@ async function d1Init(env) {
         try {
             await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)").run();
             await env.IOT_DB.prepare("CREATE TABLE IF NOT EXISTS active_conns (conn_id TEXT PRIMARY KEY, uuid TEXT, label TEXT, connected_at INTEGER, last_seen INTEGER)").run();
+            try { await env.IOT_DB.prepare("ALTER TABLE active_conns ADD COLUMN target TEXT").run(); } catch(e) {}
             env.IOT_DB_INITIALIZED = true;
         } catch(e) { env.IOT_DB_INITIALIZED = true; }
     }
@@ -165,14 +166,14 @@ async function cachedD1Put(env, key, value) {
 // on a completely different isolate than the ones proxying live traffic, the in-memory
 // counter alone is unreliable for display. These helpers persist connection state to D1
 // so it can be read back reliably from any isolate.
-async function d1RegisterConn(env, connId, uuid, label) {
+async function d1RegisterConn(env, connId, uuid, label, target) {
     if (!env.IOT_DB) return;
     await d1Init(env);
     try {
         const now = Date.now();
         await env.IOT_DB.prepare(
-            "INSERT INTO active_conns (conn_id, uuid, label, connected_at, last_seen) VALUES (?, ?, ?, ?, ?) ON CONFLICT(conn_id) DO UPDATE SET last_seen=excluded.last_seen"
-        ).bind(connId, uuid, label || "", now, now).run();
+            "INSERT INTO active_conns (conn_id, uuid, label, connected_at, last_seen, target) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(conn_id) DO UPDATE SET last_seen=excluded.last_seen, target=excluded.target"
+        ).bind(connId, uuid, label || "", now, now, target || "").run();
     } catch (e) {}
 }
 async function d1TouchConn(env, connId) {
@@ -187,13 +188,42 @@ async function d1RemoveConn(env, connId) {
 // dead (isolate evicted without firing close/error) and is pruned on read.
 const CONN_HEARTBEAT_MS = 45000;
 const CONN_STALE_MS = 120000;
+
+// Lazy, cached DNS-over-HTTPS resolution used only for admin-panel display purposes.
+// Never used for the actual proxy connection (that always uses the original host).
+const dnsCache = new Map(); // host -> { ip, ts }
+const DNS_CACHE_TTL_MS = 10 * 60 * 1000;
+const IP_LITERAL_RE = /^(\d{1,3}\.){3}\d{1,3}$|^\[?[0-9a-fA-F:]+\]?$/;
+async function resolveHostForDisplay(host) {
+    if (!host) return host;
+    if (IP_LITERAL_RE.test(host)) return host;
+    const cached = dnsCache.get(host);
+    if (cached && (Date.now() - cached.ts) < DNS_CACHE_TTL_MS) return cached.ip;
+    try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 1500);
+        const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, {
+            headers: { "Accept": "application/dns-json" }, signal: ctrl.signal
+        });
+        clearTimeout(t);
+        const data = await res.json();
+        const answer = (data.Answer || []).find(a => a.type === 1);
+        const ip = answer ? answer.data : host;
+        dnsCache.set(host, { ip, ts: Date.now() });
+        return ip;
+    } catch (e) {
+        dnsCache.set(host, { ip: host, ts: Date.now() });
+        return host;
+    }
+}
+
 async function d1GetActiveConns(env) {
     if (!env.IOT_DB) return [];
     await d1Init(env);
     try {
         const cutoff = Date.now() - CONN_STALE_MS;
         await env.IOT_DB.prepare("DELETE FROM active_conns WHERE last_seen < ?").bind(cutoff).run();
-        const { results } = await env.IOT_DB.prepare("SELECT conn_id, uuid, label, connected_at, last_seen FROM active_conns ORDER BY connected_at DESC").all();
+        const { results } = await env.IOT_DB.prepare("SELECT conn_id, uuid, label, connected_at, last_seen, target FROM active_conns ORDER BY connected_at DESC").all();
         return results || [];
     } catch (e) { return []; }
 }
@@ -1215,10 +1245,16 @@ async function handleStatsApi(request, env) {
         // Cross-isolate connection list (D1-backed); falls back to the local in-isolate
         // counter only when no database is bound.
         const liveConns = env.IOT_DB ? await d1GetActiveConns(env) : null;
-        const connectionsList = (liveConns || []).map(c => {
+        const connectionsList = await Promise.all((liveConns || []).map(async c => {
             const user = users.find(u => u.id.replace(/-/g, '').toLowerCase() === c.uuid);
-            return { uuid: c.uuid, name: (user && user.name) || c.label || c.uuid, connectedAt: c.connected_at };
-        });
+            let displayIp = "";
+            if (c.target) {
+                const [host, port] = c.target.split(":");
+                const ip = await resolveHostForDisplay(host);
+                displayIp = port ? `${ip}:${port}` : ip;
+            }
+            return { uuid: c.uuid, name: (user && user.name) || c.label || c.uuid, connectedAt: c.connected_at, target: c.target || "", ip: displayIp };
+        }));
         const liveActiveConnections = liveConns !== null ? connectionsList.length : activeConnections;
 
         // Cloudflare Workers request count for today, via the stored account/API token.
@@ -3091,8 +3127,8 @@ async function startDataPipe(webSocket, env, ctx) {
     webSocket.addEventListener('error', () => activeConnections--);
     const connId = crypto.randomUUID();
     let hbTimer = null;
-    function trackConnStart(uuid, label) {
-        ctx?.waitUntil(d1RegisterConn(env, connId, uuid, label).catch(() => {}));
+    function trackConnStart(uuid, label, target) {
+        ctx?.waitUntil(d1RegisterConn(env, connId, uuid, label, target).catch(() => {}));
         hbTimer = setInterval(() => { ctx?.waitUntil(d1TouchConn(env, connId).catch(() => {})); }, CONN_HEARTBEAT_MS);
         const stop = () => { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } ctx?.waitUntil(d1RemoveConn(env, connId).catch(() => {})); };
         webSocket.addEventListener('close', stop);
@@ -3130,7 +3166,6 @@ async function startDataPipe(webSocket, env, ctx) {
 
             activeClientHash = clientHash;
             activeProfile = matchedProfileAlpha;
-            trackConnStart(clientHash, matchedProfileAlpha.name || "");
             trackUsage(activeClientHash, 0, env, ctx);
 
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
@@ -3148,6 +3183,7 @@ async function startDataPipe(webSocket, env, ctx) {
             else if (aType === 2) { aLen = view[vPos]; vPos++; targetAddr = new TextDecoder().decode(view.slice(vPos, vPos + aLen)); }
             else if (aType === 3) { aLen = 16; const dv = new DataView(bufferData.slice(vPos, vPos + aLen)); targetAddr = Array.from({ length: 8 }, (_, i) => dv.getUint16(i * 2).toString(16)).join(":"); }
             offset = vPos + aLen;
+            trackConnStart(clientHash, matchedProfileAlpha.name || "", targetAddr ? `${targetAddr}:${targetPort}` : "");
         } else {
             let ePos = bufferData.byteLength;
             for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
@@ -3159,7 +3195,6 @@ async function startDataPipe(webSocket, env, ctx) {
             activeClientHash = validProfile.id.replace(/-/g, '').toLowerCase();
             if (!registerConnectionSlot(activeClientHash, validProfile.maxConnections, webSocket)) return false; // DROP IF CONNECTION LIMIT REACHED
             activeProfile = validProfile;
-            trackConnStart(activeClientHash, validProfile.name || "");
             trackUsage(activeClientHash, 0, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
@@ -3176,6 +3211,7 @@ async function startDataPipe(webSocket, env, ctx) {
             hPos += aLen;
             targetPort = new DataView(bufferData.slice(hPos, hPos + 2)).getUint16(0);
             offset = hPos + 4;
+            trackConnStart(activeClientHash, validProfile.name || "", targetAddr ? `${targetAddr}:${targetPort}` : "");
         }
 
         let isDomain = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(targetAddr) || /^[a-zA-Z0-9-]+$/.test(targetAddr);
@@ -4839,22 +4875,31 @@ function getDashboardUI(hasDB) {
                               </div>
                           </div>
 
-                          <!-- Recent Activity & Quick Actions Row -->
-                          <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 md:gap-4">
+                          <!-- Recent Activity & Quick Actions -->
+                          <div class="grid grid-cols-1 gap-3 md:gap-4">
                               <!-- Recent Activity -->
-                              <div class="lg:col-span-2 bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <div class="flex items-center justify-between mb-3 md:mb-4">
-                                      <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="ov_recent_activity">Recent Activity</h3>
-                                      <button onclick="switchTab('logs')" class="text-[11px] md:text-xs text-primary hover:text-primary/80 font-bold transition-colors" data-i18n="ov_view_all">View All &rarr;</button>
-                                  </div>
-                                  <div id="ov-activity-list" class="space-y-1.5 md:space-y-2.5">
-                                      <p class="text-sm text-slate-400 text-center py-6" data-i18n="ov_loading">Loading...</p>
+                              <div class="accordion-item bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                                  <button type="button" onclick="toggleAccordion('acc-ov1')" class="acc-toggle w-full flex items-center justify-between gap-3 p-4 md:p-6 text-start">
+                                      <span class="flex items-center gap-2 text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider"><span class="text-lg">📜</span><span data-i18n="ov_recent_activity">Recent Activity</span></span>
+                                      <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0 rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                  </button>
+                                  <div id="acc-ov1" class="acc-body px-4 pb-4 md:px-6 md:pb-6">
+                                      <div class="flex items-center justify-end mb-3 md:mb-4 -mt-1">
+                                          <button onclick="switchTab('logs')" class="text-[11px] md:text-xs text-primary hover:text-primary/80 font-bold transition-colors" data-i18n="ov_view_all">View All &rarr;</button>
+                                      </div>
+                                      <div id="ov-activity-list" class="space-y-1.5 md:space-y-2.5">
+                                          <p class="text-sm text-slate-400 text-center py-6" data-i18n="ov_loading">Loading...</p>
+                                      </div>
                                   </div>
                               </div>
                               <!-- Quick Actions -->
-                              <div class="bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl p-4 md:p-6 shadow-sm border border-slate-200 dark:border-darkborder">
-                                  <h3 class="text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider mb-3 md:mb-4" data-i18n="ov_quick_actions">Quick Actions</h3>
-                                  <div class="grid grid-cols-2 gap-2 md:grid-cols-1 md:gap-3">
+                              <div class="accordion-item bg-white dark:bg-darkcard rounded-2xl md:rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                                  <button type="button" onclick="toggleAccordion('acc-ov2')" class="acc-toggle w-full flex items-center justify-between gap-3 p-4 md:p-6 text-start">
+                                      <span class="flex items-center gap-2 text-xs md:text-sm uppercase font-bold text-slate-500 tracking-wider"><span class="text-lg">⚡</span><span data-i18n="ov_quick_actions">Quick Actions</span></span>
+                                      <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                  </button>
+                                  <div id="acc-ov2" class="acc-body hidden px-4 pb-4 md:px-6 md:pb-6">
+                                  <div class="grid grid-cols-2 gap-2 md:grid-cols-4 md:gap-3">
                                       <button onclick="openAddUserModal()" class="flex items-center justify-center md:justify-start gap-2 md:gap-3 px-3 py-2.5 md:px-4 md:py-3 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg md:rounded-xl font-bold text-xs md:text-sm transition-colors">
                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
                                           <span data-i18n="ov_add_user">Add User</span>
@@ -4871,6 +4916,7 @@ function getDashboardUI(hasDB) {
                                           <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                                           <span data-i18n="ov_refresh">Refresh Statistics</span>
                                       </button>
+                                  </div>
                                   </div>
                               </div>
                           </div>
@@ -6456,11 +6502,13 @@ conns.forEach(c => {
             name: key,
             uuid: c.uuid,
             count: 0,
-            connectedAt: c.connectedAt
+            connectedAt: c.connectedAt,
+            items: []
         };
     }
 
     grouped[key].count++;
+    grouped[key].items.push({ target: c.target || '', ip: c.ip || c.target || '', connectedAt: c.connectedAt });
 
     // نگهداری قدیمی‌ترین زمان اتصال
     if (c.connectedAt) {
@@ -6482,30 +6530,57 @@ connBadge.textContent = users.length + ' / ' + conns.length;
 if (users.length > 0) {
     connList.innerHTML = '';
 
-    users.forEach(u => {
+    users.forEach((u, idx) => {
         const since = u.connectedAt
             ? new Date(u.connectedAt).toLocaleString(
                   lang === 'fa' ? 'fa-IR' : 'en-US',
                   { hour12: false }
               )
             : '';
-            connList.insertAdjacentHTML('beforeend',
-            '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl">' +
-                '<div class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></div>' +
-                '<div class="flex-1 min-w-0">' +
-                    '<p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' +
-                        u.name +
-                    '</p>' +
+        const accId = 'ov-conn-acc-' + idx;
+        const ipMap = {};
+        u.items.forEach(it => {
+            const k = it.ip || it.target || '—';
+            if (!ipMap[k]) ipMap[k] = { ip: k, count: 0, connectedAt: it.connectedAt };
+            ipMap[k].count++;
+            if (it.connectedAt && (!ipMap[k].connectedAt || new Date(it.connectedAt) > new Date(ipMap[k].connectedAt))) {
+                ipMap[k].connectedAt = it.connectedAt;
+            }
+        });
+        const uniqueItems = Object.values(ipMap);
+        const itemsHtml = uniqueItems.map(it => {
+            const itSince = it.connectedAt
+                ? new Date(it.connectedAt).toLocaleString(lang === 'fa' ? 'fa-IR' : 'en-US', { hour12: false })
+                : '';
+            return '<div class="flex items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-white dark:bg-slate-900/40 text-[11px] font-mono">' +
+                       '<span class="text-slate-600 dark:text-slate-300 truncate">' + (it.ip || '—') + '</span>' +
+                       (it.count > 1 ? '<span class="px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-300 shrink-0">x' + it.count + '</span>' : '') +
+                       '<span class="text-slate-400 shrink-0">' + itSince + '</span>' +
+                   '</div>';
+        }).join('');
+        connList.insertAdjacentHTML('beforeend',
+            '<div class="rounded-xl bg-slate-50 dark:bg-slate-800/50 overflow-hidden">' +
+                '<button type="button" onclick="toggleAccordion(\\'' + accId + '\\')" class="acc-toggle w-full flex items-center gap-3 p-3 text-start">' +
+                    '<div class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></div>' +
+                    '<div class="flex-1 min-w-0">' +
+                        '<p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' +
+                            u.name +
+                        '</p>' +
+                    '</div>' +
+                    '<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300 shrink-0">' +
+                        u.count + ' ' + (u.count === 1 ? 'Conn' : 'Conns') +
+                    '</span>' +
+                    '<span class="text-[10px] font-mono text-slate-400 shrink-0">' +
+                        since +
+                    '</span>' +
+                    '<svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>' +
+                '</button>' +
+                '<div id="' + accId + '" class="acc-body hidden px-3 pb-3 space-y-1">' +
+                    itemsHtml +
                 '</div>' +
-                '<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300 shrink-0">' +
-                    u.count + ' ' + (u.count === 1 ? 'Conn' : 'Conns') +
-                '</span>' +
-                '<span class="text-[10px] font-mono text-slate-400 shrink-0">' +
-                    since +
-                '</span>' +
             '</div>'
         );
-        
+
     });
 } else {
     connList.innerHTML =
