@@ -199,7 +199,7 @@ const SYSTEM_DEFAULTS = {
     trustedDevices: [],
     sessionTokens: [],
 };
-
+const FAVICON_URL = "https://cdn.jsdelivr.net/gh/EbiDevSharp/nahan@main/favicon.ico";
 let sysConfig = { ...SYSTEM_DEFAULTS };
 let isolateStartTime = Date.now();
 let activeConnections = 0;
@@ -5140,6 +5140,7 @@ function getDashboardUI(hasDB) {
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Nahan Gateway</title>
       <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
+      <link rel="icon" href="${FAVICON_URL}">
       <script src="https://cdn.tailwindcss.com"></script>
       <script>
           tailwind.config = { 
