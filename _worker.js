@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.6.6";
+const CURRENT_VERSION = "2.8.2";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -23,6 +23,132 @@ const safeBtoa = (str) => {
         return btoa(str);
     }
 };
+
+// --- TOTP (RFC 6238) / 2FA helpers -----------------------------------------
+// Standard TOTP implementation compatible with any authenticator app that
+// supports the otpauth:// spec (2FAS, Google Authenticator, Authy, Aegis, etc).
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(bytes) {
+    let bits = "";
+    for (const b of bytes) bits += b.toString(2).padStart(8, "0");
+    let out = "";
+    for (let i = 0; i + 5 <= bits.length; i += 5) {
+        out += BASE32_ALPHABET[parseInt(bits.substring(i, i + 5), 2)];
+    }
+    const rem = bits.length % 5;
+    if (rem > 0) {
+        const chunk = bits.substring(bits.length - rem).padEnd(5, "0");
+        out += BASE32_ALPHABET[parseInt(chunk, 2)];
+    }
+    return out;
+}
+
+function base32Decode(str) {
+    const clean = str.toUpperCase().replace(/[^A-Z2-7]/g, "");
+    let bits = "";
+    for (const c of clean) {
+        const idx = BASE32_ALPHABET.indexOf(c);
+        if (idx === -1) continue;
+        bits += idx.toString(2).padStart(5, "0");
+    }
+    const bytes = [];
+    for (let i = 0; i + 8 <= bits.length; i += 8) {
+        bytes.push(parseInt(bits.substring(i, i + 8), 2));
+    }
+    return new Uint8Array(bytes);
+}
+
+function generateTotpSecret() {
+    const raw = new Uint8Array(20);
+    crypto.getRandomValues(raw);
+    return base32Encode(raw);
+}
+
+function buildOtpAuthUri(secret, accountLabel, issuer) {
+    const label = encodeURIComponent(`${issuer}:${accountLabel}`);
+    const params = `secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+    return `otpauth://totp/${label}?${params}`;
+}
+
+async function hmacSha1(keyBytes, msgBytes) {
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
+    return new Uint8Array(sig);
+}
+
+async function totpCodeForCounter(secretBase32, counter) {
+    const keyBytes = base32Decode(secretBase32);
+    const msg = new Uint8Array(8);
+    let c = BigInt(counter);
+    for (let i = 7; i >= 0; i--) { msg[i] = Number(c & 0xffn); c >>= 8n; }
+    const hmac = await hmacSha1(keyBytes, msg);
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const binCode = ((hmac[offset] & 0x7f) << 24) | ((hmac[offset + 1] & 0xff) << 16) | ((hmac[offset + 2] & 0xff) << 8) | (hmac[offset + 3] & 0xff);
+    return (binCode % 1000000).toString().padStart(6, "0");
+}
+
+// Verifies a 6-digit TOTP code allowing +/-1 time step (30s) of clock drift.
+async function verifyTotpCode(secretBase32, code, stepSeconds = 30, window = 1) {
+    if (!secretBase32 || !code) return false;
+    const cleanCode = String(code).replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(cleanCode)) return false;
+    const counter = Math.floor(Date.now() / 1000 / stepSeconds);
+    for (let w = -window; w <= window; w++) {
+        const expected = await totpCodeForCounter(secretBase32, counter + w);
+        if (expected === cleanCode) return true;
+    }
+    return false;
+}
+
+async function sha256Hex(text) {
+    const data = new TextEncoder().encode(text);
+    const hashBuf = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function generateRecoveryCodes(count = 10) {
+    const codes = [];
+    for (let i = 0; i < count; i++) {
+        const raw = new Uint8Array(5);
+        crypto.getRandomValues(raw);
+        const hex = Array.from(raw).map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+        codes.push(`${hex.slice(0, 5)}-${hex.slice(5, 10)}`);
+    }
+    return codes;
+}
+// --- end TOTP / 2FA helpers -------------------------------------------------
+
+// Session-token auth: after a full login (password + 2FA if enabled), the
+// browser is given an opaque random token instead of the master key. This
+// helper accepts either the real master key OR a still-valid session token,
+// so every API route can keep the same `key` field without ever requiring
+// the browser to hold the real password after the initial login.
+const SESSION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24h sliding window
+
+async function mintSessionToken(env, ctx) {
+    const token = base32Encode(crypto.getRandomValues(new Uint8Array(24)));
+    const hash = await sha256Hex(token);
+    const tokens = (sysConfig.sessionTokens || []).filter(t => t.expiry > Date.now());
+    tokens.push({ hash, expiry: Date.now() + SESSION_TOKEN_TTL_MS });
+    sysConfig = { ...sysConfig, sessionTokens: tokens };
+    if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+    return token;
+}
+
+async function isKeyAuthorized(providedKey, env, ctx) {
+    if (!providedKey) return false;
+    if (providedKey === sysConfig.masterKey) return true;
+    const hash = await sha256Hex(providedKey);
+    const tokens = sysConfig.sessionTokens || [];
+    const match = tokens.find(t => t.hash === hash && t.expiry > Date.now());
+    if (!match) return false;
+    // sliding expiry: extend the token's life while it's actively used
+    match.expiry = Date.now() + SESSION_TOKEN_TTL_MS;
+    if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+    return true;
+}
+// --- end session-token helpers -----------------------------------------------
 
 const SYSTEM_DEFAULTS = {
     name: "",
@@ -64,6 +190,14 @@ const SYSTEM_DEFAULTS = {
     hubPanelUrl: "",
     allowSyncWorker: false,
     add_panel: "Add Panel",
+    timezone: "Asia/Tehran",
+    // --- 2FA state ---
+    totpEnabled: false,
+    totpSecret: "",
+    totpPendingSecret: "",
+    recoveryCodeHashes: [],
+    trustedDevices: [],
+    sessionTokens: [],
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -261,7 +395,7 @@ function sha224Hex(m) {
 }
 function isWithinAccessHours(user) {
     if (!user.accessHourFrom || !user.accessHourTo) return true;
-    const now = new Date().toLocaleString('en-US', { timeZone: sysConfig.timezone || 'Asia/Tehran' });
+ const now = new Date().toLocaleString('en-US', { timeZone: sysConfig.timezone || 'Asia/Tehran' });   
     const cur = new Date(now);
     const curMins = cur.getHours() * 60 + cur.getMinutes();
     const [fh, fm] = user.accessHourFrom.split(':').map(Number);
@@ -360,6 +494,7 @@ export default {
                 data: `/${encodeURI(sysConfig.apiRoute)}`,
                 dash: `/${encodeURI(sysConfig.apiRoute)}/dash`,
                 auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
+                twofa: `/${encodeURI(sysConfig.apiRoute)}/api/2fa`,
                 sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
                 tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
                 syncPanel: `/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`,
@@ -367,13 +502,17 @@ export default {
                 users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
                 update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
+                download: `/${encodeURI(sysConfig.apiRoute)}/api/download-worker`,
+                upload: `/${encodeURI(sysConfig.apiRoute)}/api/upload-worker`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
             const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
             const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
             const isUpdateRoute = reqPath === routes.update || reqPath.endsWith('/api/update');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute;
+            const isDownloadRoute = reqPath === routes.download || reqPath.endsWith('/api/download-worker');
+            const isUploadRoute = reqPath === routes.upload || reqPath.endsWith('/api/upload-worker');
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.twofa || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isDownloadRoute || isUploadRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -389,6 +528,11 @@ export default {
                     }
                     if (request.method !== "POST") return new Response("405", { status: 405 });
                     return await handleAuth(request, url.hostname, ctx, env);
+                }
+                if (reqPath === routes.twofa) {
+                    if (request.method === "OPTIONS") return await handleTwoFactorApi(request, env, ctx, url.hostname);
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleTwoFactorApi(request, env, ctx, url.hostname);
                 }
                 if (reqPath === routes.sync || isSyncRoute) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -406,6 +550,13 @@ export default {
                 }
                 if (isUpdateRoute) {
                     return await handleUpdateApi(request, env, ctx);
+                }
+                if (isDownloadRoute) {
+                    return await handleDownloadWorker(request, env);
+                }
+                if (isUploadRoute) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleUploadWorker(request, env, ctx);
                 }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -519,7 +670,13 @@ export default {
                         // Safe auto-detect for raw sync or no-flag links using target browser / client User-Agent
                         if (ua.includes(getGamma()) || ua.includes("meta") || ua.includes("sta" + "sh") || ua.includes("verge") || ua.includes("mihomo") || ua.includes("cfw") || ua.includes("stash") || ua.includes("clash")) {
                             isClashYaml = true;
-                        } else if (ua.includes("sing-box") || ua.includes("singbox") || ua.includes("hiddify") || ua.includes("nekobox") || ua.includes("sfa") || ua.includes("karing") || ua.includes("v2rayng")) {
+                        // "v2rayng" was previously (incorrectly) routed to the sing-box
+                        // JSON branch. v2rayNG's own auto-update requests carry that UA
+                        // substring but v2rayNG cannot parse sing-box JSON — it expects
+                        // the plain base64 vless/trojan URI list (the final "else" branch
+                        // below). Leaving it in this list broke its in-app subscription
+                        // update silently (old links just stayed cached).
+                        } else if (ua.includes("sing-box") || ua.includes("singbox") || ua.includes("hiddify") || ua.includes("nekobox") || ua.includes("sfa") || ua.includes("karing")) {
                             isSingboxJson = true;
                         }
                     }
@@ -976,42 +1133,21 @@ async function sendTelegramMessage(request, type, hostName) {
         `👥 **${locT("users")}**: ${usersList.length} (${activeCount} ${locT("count_active")}, ${pausedCount} ${locT("count_paused")}, ${autoDisabledCount} ${locT("count_disabled")})\n` +
         `━━━━━━━━━━━━━━━━`;
 
+    // Same button layout as the bot's own main menu (getMainMenu), so every
+    // notification (login alerts, update alerts, etc.) lands with the exact
+    // buttons the admin already knows from /start, instead of a separate,
+    // out-of-sync button set.
     /** @type {any} */
     const inline_keyboard = [
         [
-            { text: `👥 ${locT("users")}`, callback_data: "subs_list:0" },
-            { text: `🔍 ${locT("search")}`, callback_data: "sub_search_init" }
-        ],
-        [
-            { text: `📊 ${locT("dashboard")}`, callback_data: "sys_dashboard" },
+            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" },
             { text: `📈 ${locT("statistics")}`, callback_data: "sys_stats" }
         ],
         [
-            { text: `🔗 ${locT("btn_sub_link")}`, callback_data: "get_sub_link" }
+            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } }
         ],
         [
-            { text: `🚫 ${locT("disabled_users")}`, callback_data: "subs_disabled:0" }
-        ],
-        [
-            { text: `🔄 ${locT("switch_panel")}`, callback_data: "switch_panel" },
-            { text: `➕ ${locT("add_panel")}`, callback_data: "add_panel_init" }
-        ],
-        [
-            { text: `${locT("btn_check_update")}`, callback_data: "sys_check_update" }
-        ],
-        [
-            { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-            { text: isPaused ? locT("btn_resume") : locT("btn_pause"), callback_data: "sys_toggle_status" }
-        ],
-        [
-            { text: `🔑 ${locT("dash")}`, web_app: { url: panelUrl } },
-            { text: `ℹ️ ${locT("panel_info")}`, callback_data: "sys_panel_info" }
-        ],
-        [
-            { text: `🚨 ${locT("panic")}`, callback_data: "sys_panic_init" }
-        ],
-        [
-            { text: `📱 Mini App`, web_app: { url: panelUrl } }
+            { text: `⚙️ ${locT("btn_settings")}`, callback_data: "settings_menu" }
         ]
     ];
 
@@ -1031,6 +1167,20 @@ async function sendTelegramMessage(request, type, hostName) {
     } catch (e) {}
 }
 
+// Shared "panel updated" Telegram push, used by both the web-panel update
+// button (/api/update) and the bot's own "Deploy update" flow, so the admin
+// always gets pinged regardless of which path triggered the deploy.
+function notifyPanelUpdatedTelegram(ctx, newVersion, via = "") {
+    if (!(sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId))) return;
+    const suffix = via ? ` (${via})` : "";
+    const tgMsg = `🔄 <b>Panel Updated</b>\n\n📦 v${CURRENT_VERSION} → v${newVersion}${suffix}`;
+    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
+    ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
+    }).catch(() => {}));
+}
+
 async function logActivity(env, type, detail) {
     if (!env || !env.IOT_DB) return;
     try {
@@ -1048,7 +1198,7 @@ async function handleLogs(request, env) {
     try {
         if (request.method === "POST") {
             const data = await request.json();
-            if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
+            if (!(await isKeyAuthorized(data.key, env))) return new Response(JSON.stringify({ success: false }), { status: 401 });
             let logs = [];
             if (env.IOT_DB) {
                 const stored = await d1Get(env, "sys_logs");
@@ -1076,7 +1226,7 @@ async function handleUsersApi(request, env, ctx) {
                 bodyKey = body.key || "";
             } catch(e) {}
         }
-        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey);
+        const isAuth = (await isKeyAuthorized(authKey, env, ctx)) || (await isKeyAuthorized(bodyKey, env, ctx));
         if (!isAuth) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
@@ -1214,12 +1364,216 @@ if (body.cleanIp !== undefined) u.cleanIp = body.cleanIp;
     } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
 }
 
+async function fetchLiveWorkerCode(liveOnly = false) {
+    let code = null;
+    let liveError = null;
+
+    if (sysConfig.cfAccountId && sysConfig.cfApiToken && sysConfig.cfWorkerName) {
+        try {
+            const res = await fetch(
+                `https://api.cloudflare.com/client/v4/accounts/${sysConfig.cfAccountId}/workers/scripts/${encodeURIComponent(sysConfig.cfWorkerName)}`,
+                {
+                    headers: {
+                        "Authorization": `Bearer ${sysConfig.cfApiToken}`
+                    }
+                }
+            );
+
+            if (res.ok) {
+                const contentType = res.headers.get("content-type") || "";
+
+                if (
+                    contentType.includes("multipart/form-data") ||
+                    contentType.includes("multipart/mixed")
+                ) {
+                    const form = await res.formData();
+
+                    // Debug
+                    for (const [key, value] of form.entries()) {
+                        console.log(
+                            "CF Part:",
+                            key,
+                            value?.constructor?.name,
+                            value
+                        );
+                    }
+
+                    const filePart =
+                        form.get("_worker.js") ||
+                        form.get("worker.js") ||
+                        form.get("index.js") ||
+                        form.get("main.js") ||
+                        [...form.values()].find(v => v && typeof v.text === "function") ||
+                        [...form.values()][0];
+
+                    if (filePart) {
+                        if (typeof filePart === "string") {
+                            code = filePart;
+                        } else if (typeof filePart.text === "function") {
+                            code = await filePart.text();
+                        } else if (filePart instanceof Blob) {
+                            code = await filePart.text();
+                        } else {
+                            console.warn("Unknown multipart part:", filePart);
+
+                            try {
+                                code = JSON.stringify(filePart, null, 2);
+                            } catch {
+                                code = String(filePart);
+                            }
+                        }
+                    }
+
+                    if (!code) {
+                        liveError = "Cloudflare returned multipart data but no readable worker source was found.";
+                    }
+                } else {
+                    code = await res.text();
+                }
+            } else {
+                let bodyText = "";
+                try {
+                    bodyText = await res.text();
+                } catch {}
+
+                liveError = `Cloudflare API returned HTTP ${res.status}: ${bodyText.slice(0, 300)}`;
+            }
+        } catch (e) {
+            liveError = "Request to Cloudflare API failed: " + (e?.message || e);
+        }
+    } else {
+        liveError = "Cloudflare API credentials (Account ID / API Token / Worker Name) are not configured.";
+    }
+
+    if (liveOnly) {
+        return {
+            code,
+            source: "cloudflare",
+            error: liveError
+        };
+    }
+
+    if (!code) {
+        const repo = (sysConfig.githubRepo || "EbiDevSharp/nahan")
+            .replace(/https?:\/\/github\.com\//, "")
+            .trim();
+
+        try {
+            const res = await fetch(
+                `https://raw.githubusercontent.com/${repo}/main/_worker.js`
+            );
+
+            if (res.ok) {
+                code = await res.text();
+            }
+        } catch {}
+
+        return {
+            code,
+            source: "github",
+            error: liveError
+        };
+    }
+
+    return {
+        code,
+        source: "cloudflare",
+        error: null
+    };
+}
+
+async function performWorkerUpload(env, ctx, code) {
+    if (!code || code.trim().length < 50) {
+        return { success: false, error: "No valid code provided." };
+    }
+    if (!sysConfig.cfAccountId || !sysConfig.cfApiToken || !sysConfig.cfWorkerName) {
+        return { success: false, error: "Cloudflare API credentials are not configured (Account ID / API Token / Worker Name)." };
+    }
+    try {
+        const deployRes = await deployWorkerToCloudflare(sysConfig.cfAccountId, sysConfig.cfApiToken, sysConfig.cfWorkerName, code);
+        const rawText = await deployRes.text();
+        let json = null;
+        try { json = JSON.parse(rawText); } catch (e) {}
+
+        if (!deployRes.ok || !json || json.success !== true) {
+            let errMsg = `HTTP ${deployRes.status}`;
+            if (json && Array.isArray(json.errors) && json.errors.length) {
+                errMsg = json.errors.map(e => `[${e.code}] ${e.message}`).join("; ");
+            } else if (rawText) {
+                errMsg = rawText.slice(0, 400);
+            }
+            return { success: false, error: "Cloudflare deploy failed: " + errMsg };
+        }
+        ctx?.waitUntil(logActivity(env, "Worker Uploaded", "Worker code updated via manual upload").catch(() => {}));
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+async function handleDownloadWorker(request, env) {
+    try {
+        const url = new URL(request.url);
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        if (!(await isKeyAuthorized(authKey, env))) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        const liveOnly = url.searchParams.get("source") === "live";
+        const result = await fetchLiveWorkerCode(liveOnly);
+
+        if (!result.code) {
+            return new Response(JSON.stringify({ success: false, error: result.error || "Could not retrieve worker source" }), { status: 502, headers: { "Content-Type": "application/json" } });
+        }
+
+        return new Response(result.code, {
+            headers: {
+                "Content-Type": "application/javascript; charset=utf-8",
+                "Content-Disposition": `attachment; filename="nahan_worker_${CURRENT_VERSION}.js"`,
+                "X-Worker-Source": result.source
+            }
+        });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+}
+
+async function handleUploadWorker(request, env, ctx) {
+    try {
+        const url = new URL(request.url);
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        if (!(await isKeyAuthorized(authKey, env, ctx))) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        const body = await request.json();
+        let code = body.code || null;
+
+        if (!code && body.url) {
+            try {
+                const res = await fetch(body.url);
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                code = await res.text();
+            } catch (e) {
+                return new Response(JSON.stringify({ success: false, error: "Could not fetch from URL: " + e.message }), { status: 400, headers: { "Content-Type": "application/json" } });
+            }
+        }
+
+        const result = await performWorkerUpload(env, ctx, code);
+        return new Response(JSON.stringify(result), { status: result.success ? 200 : 400, headers: { "Content-Type": "application/json" } });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+}
+
 async function handleStatsApi(request, env) {
     try {
         const url = new URL(request.url);
         const authHeader = request.headers.get("Authorization") || "";
         const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
-        if (authKey !== sysConfig.masterKey) {
+        if (!(await isKeyAuthorized(authKey, env))) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
 
@@ -1291,7 +1645,7 @@ async function handleUpdateApi(request, env, ctx) {
     try {
         if (request.method !== "POST") return new Response("405", { status: 405 });
         const data = await request.json();
-        if (data.key !== sysConfig.masterKey) {
+        if (!(await isKeyAuthorized(data.key, env, ctx))) {
             return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
 
@@ -1358,14 +1712,7 @@ async function handleUpdateApi(request, env, ctx) {
 
             if (deployResult.success) {
                 ctx?.waitUntil(logActivity(env, "Panel Updated", `v${CURRENT_VERSION} → v${newVersion}`).catch(()=>{}));
-                if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
-                    const tgMsg = `🔄 <b>Panel Updated</b>\n\n📦 v${CURRENT_VERSION} → v${newVersion}`;
-                    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
-                    ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
-                    }).catch(()=>{}));
-                }
+                notifyPanelUpdatedTelegram(ctx, newVersion);
                 return new Response(JSON.stringify({ success: true, message: `Updated to v${newVersion}`, newVersion }), { headers: { "Content-Type": "application/json" } });
             } else {
                 const errMsg = deployResult.errors?.[0]?.message || "Unknown API error";
@@ -1379,48 +1726,125 @@ async function handleUpdateApi(request, env, ctx) {
     }
 }
 
+// Checks the second factor for a login attempt once the master key has already
+// matched. Returns one of: { ok:true, trustToken?:string } | { ok:false, need2fa:true } | { ok:false }
+async function verifySecondFactor(data, env, ctx, ip) {
+    if (!sysConfig.totpEnabled) return { ok: true };
+
+    // 1) Trusted-device token (issued after a prior successful 2FA login with "remember" checked)
+    if (data.trustToken) {
+        const tokenHash = await sha256Hex(data.trustToken);
+        const devices = sysConfig.trustedDevices || [];
+        const match = devices.find(d => d.hash === tokenHash && d.expiry > Date.now());
+        if (match) return { ok: true };
+    }
+
+    // 2) A fresh TOTP code from an authenticator app (2FAS, Google Authenticator, Authy, ...)
+    if (data.totp) {
+        const valid = await verifyTotpCode(sysConfig.totpSecret, data.totp);
+        if (valid) {
+            let trustToken = null;
+            if (data.remember) {
+                trustToken = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
+                const hash = await sha256Hex(trustToken);
+                const devices = (sysConfig.trustedDevices || []).filter(d => d.expiry > Date.now());
+                devices.push({ hash, expiry: Date.now() + 30 * 24 * 60 * 60 * 1000 });
+                sysConfig = { ...sysConfig, trustedDevices: devices };
+                if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+            }
+            return { ok: true, trustToken };
+        }
+        ctx?.waitUntil(logActivity(env, "2FA Failed", `Wrong TOTP code from ${ip}`));
+        return { ok: false };
+    }
+
+    // 3) A one-time recovery code, for when the authenticator device is lost.
+    if (data.recoveryCode) {
+        const cleanCode = String(data.recoveryCode).trim().toUpperCase();
+        const codeHash = await sha256Hex(cleanCode);
+        const hashes = sysConfig.recoveryCodeHashes || [];
+        if (hashes.includes(codeHash)) {
+            const remaining = hashes.filter(h => h !== codeHash);
+            sysConfig = { ...sysConfig, recoveryCodeHashes: remaining };
+            if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+            ctx?.waitUntil(logActivity(env, "Recovery Login", `Login via recovery code from ${ip} (one-time code consumed, ${remaining.length} left)`));
+            return { ok: true, usedRecoveryCode: true, recoveryRemaining: remaining.length };
+        }
+        return { ok: false };
+    }
+
+    // Password matched but no second factor was supplied yet.
+    return { ok: false, need2fa: true };
+}
+
 async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
-        if (data.key === sysConfig.masterKey) {
-            ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
-            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)", hostName));
+        const isRawPassword = data.key === sysConfig.masterKey;
+        const isTokenAuth = !isRawPassword && await isKeyAuthorized(data.key, env, ctx);
 
-            // Store login signal for Telegram bot
-            if (sysConfig.tgAdminId && env.IOT_DB) {
-                const loginSignal = {
-                    name: sysConfig.name || hostName,
-                    host: hostName,
-                    apiRoute: sysConfig.apiRoute,
-                    masterKey: sysConfig.masterKey,
-                    isLocal: true,
-                    ts: Date.now()
-                };
-                ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(() => {}));
-            }
+        if (isRawPassword || isTokenAuth) {
+            let trustToken = null, usedRecoveryCode = false, recoveryRemaining = null;
 
-            // Notify hub panel if configured
-            if (sysConfig.hubPanelUrl && sysConfig.hubPanelUrl.trim() && sysConfig.tgAdminId) {
-                try {
-                    let hubUrl = sysConfig.hubPanelUrl.trim();
-                    if (!hubUrl.startsWith('http')) hubUrl = 'https://' + hubUrl;
-                    const signalPayload = {
-                        signal: "panel_login",
-                        panelName: sysConfig.name || hostName,
-                        panelHost: hostName,
-                        panelApiRoute: sysConfig.apiRoute,
-                        panelMasterKey: sysConfig.masterKey,
-                        tgAdminId: sysConfig.tgAdminId,
+            if (isRawPassword) {
+                // Fresh login with the real master key still goes through the full 2FA gate.
+                const twoFa = await verifySecondFactor(data, env, ctx, ip);
+                if (!twoFa.ok) {
+                    if (twoFa.need2fa) {
+                        return new Response(JSON.stringify({ success: false, need2fa: true }), { status: 401, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
+                    }
+                    ctx?.waitUntil(logActivity(env, "Auth Failed", `Correct password but invalid 2FA code from ${ip}`));
+                    if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل (کد ۲مرحله‌ای اشتباه)!", hostName));
+                    return new Response(JSON.stringify({ success: false }), { status: 401, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
+                }
+                trustToken = twoFa.trustToken || null;
+                usedRecoveryCode = !!twoFa.usedRecoveryCode;
+                recoveryRemaining = typeof twoFa.recoveryRemaining === "number" ? twoFa.recoveryRemaining : null;
+
+                ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
+                if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)", hostName));
+
+                // Store login signal for Telegram bot
+                if (sysConfig.tgAdminId && env.IOT_DB) {
+                    const loginSignal = {
+                        name: sysConfig.name || hostName,
+                        host: hostName,
+                        apiRoute: sysConfig.apiRoute,
+                        masterKey: sysConfig.masterKey,
+                        isLocal: true,
                         ts: Date.now()
                     };
-                    ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(signalPayload)
-                    }).catch(() => {}));
-                } catch(e) {}
+                    ctx?.waitUntil(d1Put(env, "tg_panel_login", JSON.stringify(loginSignal)).catch(() => {}));
+                }
+
+                // Notify hub panel if configured
+                if (sysConfig.hubPanelUrl && sysConfig.hubPanelUrl.trim() && sysConfig.tgAdminId) {
+                    try {
+                        let hubUrl = sysConfig.hubPanelUrl.trim();
+                        if (!hubUrl.startsWith('http')) hubUrl = 'https://' + hubUrl;
+                        const signalPayload = {
+                            signal: "panel_login",
+                            panelName: sysConfig.name || hostName,
+                            panelHost: hostName,
+                            panelApiRoute: sysConfig.apiRoute,
+                            panelMasterKey: sysConfig.masterKey,
+                            tgAdminId: sysConfig.tgAdminId,
+                            ts: Date.now()
+                        };
+                        ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(signalPayload)
+                        }).catch(() => {}));
+                    } catch(e) {}
+                }
             }
+
+            // Fresh password logins mint a brand-new session token; a request that
+            // already authenticated via a valid token just gets that same token back
+            // (its sliding expiry was already extended inside isKeyAuthorized).
+            const sessionToken = isRawPassword ? await mintSessionToken(env, ctx) : data.key;
 
             const netInfo = {
                 ip: ip,
@@ -1442,9 +1866,20 @@ async function handleAuth(request, hostName, ctx, env) {
                     protocol = customUrl.protocol.replace(':', '');
                 } catch(e) {}
             }
+            // Never expose internal 2FA/session secrets to the browser.
+            const safeConfig = { ...sysConfig };
+            delete safeConfig.totpSecret;
+            delete safeConfig.totpPendingSecret;
+            delete safeConfig.recoveryCodeHashes;
+            delete safeConfig.trustedDevices;
+            delete safeConfig.sessionTokens;
             return new Response(JSON.stringify({
-                success: true, config: sysConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
+                success: true, config: safeConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
                 version: CURRENT_VERSION,
+                sessionToken,
+                trustToken,
+                usedRecoveryCode,
+                recoveryRemaining,
                 profiles: getAllProfiles().map(p => {
                     let subSuffix = p.name === 'Default' ? '' : '?sub=' + encodeURIComponent(p.name);
                     return {
@@ -1455,16 +1890,119 @@ async function handleAuth(request, hostName, ctx, env) {
                 })
             }), { status: 200, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
         }
-        ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
-        if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!", hostName));
+        // A "silent" attempt is the front-end's automatic re-auth on page load/refresh
+        // using a cached session token, not a real user-typed login. If that stored
+        // token happens to be expired/invalid, this branch runs on every single
+        // refresh — it should just fail quietly (still logged) without pinging Telegram.
+        if (!data.silent) {
+            ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
+            if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!", hostName));
+        } else {
+            ctx?.waitUntil(logActivity(env, "Silent Re-auth Failed", `Expired/invalid session token from ${ip}`));
+        }
         return new Response(JSON.stringify({ success: false }), { status: 401, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } }); }
+}
+
+// Handles all 2FA management actions. Every action requires the current
+// master key; enabling/disabling/regenerating additionally require a valid
+// TOTP code (or, for disable/regenerate, a recovery code) so an attacker who
+// only steals the master key still cannot touch 2FA settings.
+async function handleTwoFactorApi(request, env, ctx, hostName) {
+    const cors = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
+    if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: { ...cors, "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
+    }
+    try {
+        const data = await request.json();
+        if (!(await isKeyAuthorized(data.key, env, ctx))) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: cors });
+        }
+        const action = data.action;
+
+        if (action === "status") {
+            return new Response(JSON.stringify({
+                success: true,
+                enabled: !!sysConfig.totpEnabled,
+                recoveryCodesRemaining: (sysConfig.recoveryCodeHashes || []).length,
+                trustedDevices: (sysConfig.trustedDevices || []).filter(d => d.expiry > Date.now()).length
+            }), { status: 200, headers: cors });
+        }
+
+        if (action === "init") {
+            if (sysConfig.totpEnabled) {
+                return new Response(JSON.stringify({ success: false, error: "2FA already enabled" }), { status: 400, headers: cors });
+            }
+            const secret = generateTotpSecret();
+            sysConfig = { ...sysConfig, totpPendingSecret: secret };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            const accountLabel = sysConfig.name || hostName || "nahan-panel";
+            const otpauth = buildOtpAuthUri(secret, accountLabel, "Nahan Gateway");
+            return new Response(JSON.stringify({ success: true, secret, otpauth }), { status: 200, headers: cors });
+        }
+
+        if (action === "confirm") {
+            if (!sysConfig.totpPendingSecret) {
+                return new Response(JSON.stringify({ success: false, error: "No pending setup. Start again." }), { status: 400, headers: cors });
+            }
+            const valid = await verifyTotpCode(sysConfig.totpPendingSecret, data.code);
+            if (!valid) {
+                return new Response(JSON.stringify({ success: false, error: "Invalid code" }), { status: 401, headers: cors });
+            }
+            const recoveryCodes = generateRecoveryCodes(10);
+            const hashes = [];
+            for (const c of recoveryCodes) hashes.push(await sha256Hex(c));
+            sysConfig = { ...sysConfig, totpEnabled: true, totpSecret: sysConfig.totpPendingSecret, totpPendingSecret: "", recoveryCodeHashes: hashes, trustedDevices: [] };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "2FA Enabled", "Two-factor authentication was enabled for the panel"));
+            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "احراز هویت دومرحله‌ای (2FA) برای پنل فعال شد.", hostName));
+            return new Response(JSON.stringify({ success: true, recoveryCodes }), { status: 200, headers: cors });
+        }
+
+        if (action === "disable") {
+            const okTotp = sysConfig.totpEnabled && await verifyTotpCode(sysConfig.totpSecret, data.code);
+            let okRecovery = false;
+            if (!okTotp && data.recoveryCode) {
+                const codeHash = await sha256Hex(String(data.recoveryCode).trim().toUpperCase());
+                okRecovery = (sysConfig.recoveryCodeHashes || []).includes(codeHash);
+            }
+            if (!okTotp && !okRecovery) {
+                return new Response(JSON.stringify({ success: false, error: "Invalid code" }), { status: 401, headers: cors });
+            }
+            sysConfig = { ...sysConfig, totpEnabled: false, totpSecret: "", totpPendingSecret: "", recoveryCodeHashes: [], trustedDevices: [] };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "2FA Disabled", "Two-factor authentication was disabled for the panel"));
+            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "⚠️ احراز هویت دومرحله‌ای (2FA) برای پنل غیرفعال شد!", hostName));
+            return new Response(JSON.stringify({ success: true }), { status: 200, headers: cors });
+        }
+
+        if (action === "regenerate_recovery") {
+            if (!sysConfig.totpEnabled) {
+                return new Response(JSON.stringify({ success: false, error: "2FA is not enabled" }), { status: 400, headers: cors });
+            }
+            const valid = await verifyTotpCode(sysConfig.totpSecret, data.code);
+            if (!valid) {
+                return new Response(JSON.stringify({ success: false, error: "Invalid code" }), { status: 401, headers: cors });
+            }
+            const recoveryCodes = generateRecoveryCodes(10);
+            const hashes = [];
+            for (const c of recoveryCodes) hashes.push(await sha256Hex(c));
+            sysConfig = { ...sysConfig, recoveryCodeHashes: hashes };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "2FA Recovery Codes Regenerated", "Old recovery codes were invalidated and replaced"));
+            return new Response(JSON.stringify({ success: true, recoveryCodes }), { status: 200, headers: cors });
+        }
+
+        return new Response(JSON.stringify({ success: false, error: "Unknown action" }), { status: 400, headers: cors });
+    } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: "Bad request" }), { status: 400, headers: cors });
+    }
 }
 
 async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
-        const isAuthorized = (data.key === sysConfig.masterKey) ||
+        const isAuthorized = (await isKeyAuthorized(data.key, env, ctx)) ||
             (data.oldKey && data.oldKey === sysConfig.masterKey) ||
             (sysConfig.masterKey === "admin");
         if (!isAuthorized) return new Response(JSON.stringify({ success: false }), { status: 401 });
@@ -1476,6 +2014,13 @@ async function handleConfigSync(request, env, ctx) {
         let nextConfig = sysConfig;
         if (data.config) {
             nextConfig = { ...sysConfig, ...data.config };
+            // If the master key is being changed, force everyone (including this
+            // browser) to log in again with the new password + 2FA — old session
+            // tokens and "remembered" 2FA devices are no longer trustworthy.
+            if (data.config.masterKey && data.config.masterKey !== sysConfig.masterKey) {
+                nextConfig.sessionTokens = [];
+                nextConfig.trustedDevices = [];
+            }
             sysConfig = nextConfig;
             await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
         }
@@ -1557,6 +2102,8 @@ const botI18n = {
         welcome: "🤖 **Welcome to Nahan Gateway Bot**\nSelect your option below to manage your system:",
         status: "📊 System Status",
         users: "👥 Subscribers",
+        btn_settings: "Settings", btn_panel_ops: "Panel Operations", btn_manage_users: "Manage Subscribers",
+        msg_settings_intro: "Choose a settings category:", msg_panel_ops_intro: "Choose a panel operation:",
         metrics: "📡 Gateway Health",
         panic: "🚨 Panic Mode",
         dash: "🔑 Dashboard Control",
@@ -1642,7 +2189,15 @@ const botI18n = {
         sub_link_sent: "✅ Subscription link sent!",
         btn_update_usage: "🔄 Update Usage",
         btn_check_update: "🔄 Check for Updates",
+        btn_download_worker: "🧩 Download Worker Source",
+        btn_download_worker_live: "🌩️ Download Real Live Code (Cloudflare only)",
+        btn_upload_worker: "⬆️ Upload / Update Worker",
         msg_checking_update: "🔍 Checking for updates...",
+        msg_preparing_download: "📦 Preparing worker source file...",
+        msg_download_failed: "❌ Could not retrieve the worker source.",
+        msg_main_menu_return: "✅ Done. Sent as a file above.",
+        msg_worker_updated: "Worker updated successfully.",
+        msg_send_worker_file_or_url: "📤 Send the new _worker.js as a file, or send a direct URL to it as text.",
         msg_update_check_failed: "❌ Failed to check for updates. Please try again later.",
         msg_no_update: "✅ You are already on the latest version (v{version}).",
         msg_update_available: "🆕 A new version is available!\n\n📦 Current: v{current}\n✨ Latest: v{latest}",
@@ -1657,6 +2212,8 @@ const botI18n = {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
         status: "📊 وضعیت سیستم",
         users: "👥 مدیریت مشترکین",
+        btn_settings: "تنظیمات", btn_panel_ops: "عملیات پنل", btn_manage_users: "مدیریت مشترکین",
+        msg_settings_intro: "یکی از دسته‌های تنظیمات رو انتخاب کن:", msg_panel_ops_intro: "یکی از عملیات پنل رو انتخاب کن:",
         metrics: "📡 سلامت درگاه شبکه",
         panic: "🚨 وضعیت اضطراری (Panic)",
         dash: "🔑 پنل تحت وب",
@@ -1743,7 +2300,15 @@ const botI18n = {
         btn_update_usage: "🔄 بروزرسانی مصرف",
 	add_panel: "افزودن پنل",
         btn_check_update: "🔄 بررسی بروزرسانی",
+        btn_download_worker: "🧩 دانلود سورس ورکر",
+        btn_download_worker_live: "🌩️ دانلود کد واقعی (فقط کلودفلر)",
+        btn_upload_worker: "⬆️ آپلود / آپدیت ورکر",
         msg_checking_update: "🔍 در حال بررسی بروزرسانی...",
+        msg_preparing_download: "📦 در حال آماده‌سازی فایل سورس ورکر...",
+        msg_download_failed: "❌ دریافت سورس ورکر ممکن نشد.",
+        msg_main_menu_return: "✅ انجام شد. فایل بالا ارسال شد.",
+        msg_worker_updated: "ورکر با موفقیت آپدیت شد.",
+        msg_send_worker_file_or_url: "📤 فایل جدید _worker.js رو بفرست، یا آدرس مستقیمش رو به‌صورت متن ارسال کن.",
         msg_update_check_failed: "❌ بررسی بروزرسانی ناموفق بود. لطفاً بعداً دوباره تلاش کنید.",
         msg_no_update: "✅ شما در حال استفاده از آخرین نسخه هستید (v{version}).",
         msg_update_available: "🆕 نسخه جدیدی موجود است!\n\n📦 نسخه فعلی: v{current}\n✨ آخرین نسخه: v{latest}",
@@ -1925,64 +2490,105 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
                 `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
                 `━━━━━━━━━━━━━━━━`;
-            const panelUrl = isLocal ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash` : null;
+            // Linked (remote) panels carry their own host/apiRoute, so build the
+            // same kind of dash URL for them as we do for the local panel instead
+            // of leaving it null and silently dropping the button.
+            const panelUrl = isLocal
+                ? `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`
+                : `https://${activePanel.host}/${encodeURI(activePanel.apiRoute || sysConfig.apiRoute)}/dash`;
             const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
             /** @type {any} */
             const inline_keyboard = [];
-            if (isAdmin) {
-                inline_keyboard.push([
-                    { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
-                    { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
-                ]);
-            }
-            inline_keyboard.push([
-                { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
-                { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
-            ]);
-            inline_keyboard.push([
-                { text: `🔗 ${t("btn_sub_link")}`, callback_data: "get_sub_link" }
-            ]);
 
-            if (isAdmin) {
+            if (!isAdmin) {
                 inline_keyboard.push([
-                    { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
+                    { text: `🔗 ${t("btn_sub_link")}`, callback_data: "get_sub_link" }
                 ]);
-                const allPanels = getPanelsList();
-                if (allPanels.length > 1) {
-                    inline_keyboard.push([
-                        { text: `🔄 ${t("switch_panel")}`, callback_data: "switch_panel" },
-                        { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
-                    ]);
-                } else {
-                    inline_keyboard.push([
-                        { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
-                    ]);
-                }
                 inline_keyboard.push([
-                    { text: `${t("btn_check_update")}`, callback_data: "sys_check_update" }
+                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
                 ]);
+                const kbGuest = { inline_keyboard };
+                return { text, kb: kbGuest };
             }
+
             inline_keyboard.push([
-                { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
+                { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" },
+                { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
             ]);
             if (panelUrl) {
                 inline_keyboard.push([
-                    { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
-                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
-                ]);
-                if (isAdmin) {
-                    inline_keyboard.push([
-                        { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
-                    ]);
-                }
-            } else {
-                inline_keyboard.push([
-                    { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
+                    { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } }
                 ]);
             }
+            inline_keyboard.push([
+                { text: `⚙️ ${t("btn_settings")}`, callback_data: "settings_menu" }
+            ]);
+
             const kb = { inline_keyboard };
             return { text, kb };
+        };
+
+        const getSettingsMenu = () => {
+            const text = `⚙️ **${t("btn_settings")}**\n━━━━━━━━━━━━━━━━\n${t("msg_settings_intro")}`;
+            const inline_keyboard = [
+                [{ text: `👥 ${t("users")}`, callback_data: "users_menu" }],
+                [{ text: `🛠️ ${t("btn_panel_ops")}`, callback_data: "panel_ops_menu" }],
+                [{ text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" }],
+                [{ text: `⬅️ ${t("btn_main_menu")}`, callback_data: "main_menu" }]
+            ];
+            return { text, kb: { inline_keyboard } };
+        };
+
+        const getUsersMenu = () => {
+            const users = sysConfig.users || [];
+            const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+            const pausedCount = users.filter(u => u.isPaused).length;
+            const text = `👥 **${t("users")}**\n━━━━━━━━━━━━━━━━\n${users.length} ${t("users")} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")})`;
+            const inline_keyboard = [
+                [
+                    { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" },
+                    { text: `📋 ${t("btn_manage_users")}`, callback_data: "subs_list:0" }
+                ],
+                [{ text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }],
+                [{ text: `➕ ${t("btn_add")}`, callback_data: "sub_add_init" }],
+                [{ text: `⬅️ ${t("btn_settings")}`, callback_data: "settings_menu" }]
+            ];
+            return { text, kb: { inline_keyboard } };
+        };
+
+        const getPanelOpsMenu = () => {
+            const isPaused = sysConfig.isPaused || false;
+            const text = `🛠️ **${t("btn_panel_ops")}**\n━━━━━━━━━━━━━━━━\n${t("msg_panel_ops_intro")}`;
+            const inline_keyboard = [];
+            const allPanels = getPanelsList();
+            if (allPanels.length > 1) {
+                inline_keyboard.push([
+                    { text: `🔄 ${t("switch_panel")}`, callback_data: "switch_panel" },
+                    { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
+                ]);
+            } else {
+                inline_keyboard.push([
+                    { text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }
+                ]);
+            }
+            inline_keyboard.push([
+                { text: `${t("btn_check_update")}`, callback_data: "sys_check_update" },
+                { text: `${t("btn_download_worker")}`, callback_data: "sys_download_worker" }
+            ]);
+            inline_keyboard.push([
+                { text: `${t("btn_download_worker_live")}`, callback_data: "sys_download_worker_live" },
+                { text: `${t("btn_upload_worker")}`, callback_data: "sys_upload_worker_init" }
+            ]);
+            inline_keyboard.push([
+                { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
+            ]);
+            inline_keyboard.push([
+                { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
+            ]);
+            inline_keyboard.push([
+                { text: `⬅️ ${t("btn_settings")}`, callback_data: "settings_menu" }
+            ]);
+            return { text, kb: { inline_keyboard } };
         };
 
         const getSubsList = (page = 0, usersList = null) => {
@@ -2022,7 +2628,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             }
 
             inline_keyboard.push([{ text: `➕ ${t("btn_add")}`, callback_data: "sub_add_init" }]);
-            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+            inline_keyboard.push([{ text: `⬅️ ${t("btn_settings")}`, callback_data: "users_menu" }]);
 
             return { text, kb: { inline_keyboard } };
         };
@@ -2144,15 +2750,24 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 if (data === "main_menu") {
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "settings_menu") {
+                    const menu = getSettingsMenu();
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "users_menu") {
+                    const menu = getUsersMenu();
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
+                } else if (data === "panel_ops_menu") {
+                    const menu = getPanelOpsMenu();
+                    await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_lang") {
                     sysConfig.tgBotLang = (langCode === "fa") ? "en" : "fa";
                     await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel, isAuthorized);
+                    const menu = getSettingsMenu();
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_toggle_status") {
                     sysConfig.isPaused = !sysConfig.isPaused;
                     await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
-                    const menu = getMainMenu(activePanel, isAuthorized);
+                    const menu = getPanelOpsMenu();
                     await sendOrEdit(chatId, menu.text, menu.kb, messageId);
                 } else if (data === "sys_metrics") {
                     let usageStr = t("unlimited");
@@ -2180,7 +2795,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const page = parseInt(data.replace("subs_list:", "")) || 0;
                     const panelUsers = await getPanelUsers();
                     if (panelUsers === null && isRemotePanel) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] });
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "users_menu" }]] });
                     } else {
                         const list = getSubsList(page, panelUsers);
                         await sendOrEdit(chatId, list.text, list.kb, messageId);
@@ -2318,7 +2933,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         inline_keyboard: [
                             [
                                 { text: `🚨 YES PANIC 🚨`, callback_data: "sys_panic_confirm" },
-                                { text: `❌ No, Cancel`, callback_data: "main_menu" }
+                                { text: `❌ No, Cancel`, callback_data: "panel_ops_menu" }
                             ]
                         ]
                     };
@@ -2328,7 +2943,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     sysConfig.isPaused = true;
                     await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
 
                 } else if (data === "sys_check_update") {
@@ -2337,23 +2952,23 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (isRemotePanel) {
                         const res = await fetchRemotePanelUpdate(activePanel, "check");
                         if (!res || !res.success) {
-                            await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                             return new Response("OK", { status: 200 });
                         }
                         if (!res.updateAvailable) {
                             const text = t("msg_no_update").replace("{version}", res.current);
-                            await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                             return new Response("OK", { status: 200 });
                         }
                         const text = t("msg_update_available").replace("{current}", res.current).replace("{latest}", res.latest);
                         if (!res.canDeploy) {
-                            await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                            await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                             return new Response("OK", { status: 200 });
                         }
                         const kb = {
                             inline_keyboard: [
                                 [{ text: t("btn_deploy_update"), callback_data: `sys_deploy_confirm:${res.latest}` }],
-                                [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                                [{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]
                             ]
                         };
                         await sendOrEdit(chatId, text, kb, messageId);
@@ -2380,28 +2995,50 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         } catch(e) {}
                     }
                     if (!remoteVer) {
-                        await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        await sendOrEdit(chatId, t("msg_update_check_failed"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                         return new Response("OK", { status: 200 });
                     }
                     const updateAvailable = cmpVersions(CURRENT_VERSION, remoteVer) < 0;
                     if (!updateAvailable) {
                         const text = t("msg_no_update").replace("{version}", CURRENT_VERSION);
-                        await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        await sendOrEdit(chatId, text, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                         return new Response("OK", { status: 200 });
                     }
                     const hasCredentials = !!(sysConfig.cfAccountId && sysConfig.cfApiToken && sysConfig.cfWorkerName);
                     const text = t("msg_update_available").replace("{current}", CURRENT_VERSION).replace("{latest}", remoteVer);
                     if (!hasCredentials) {
-                        await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        await sendOrEdit(chatId, text + "\n\n" + t("msg_update_no_cf"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                         return new Response("OK", { status: 200 });
                     }
                     const kb = {
                         inline_keyboard: [
                             [{ text: t("btn_deploy_update"), callback_data: `sys_deploy_confirm:${remoteVer}` }],
-                            [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                            [{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]
                         ]
                     };
                     await sendOrEdit(chatId, text, kb, messageId);
+
+                } else if (data === "sys_download_worker" || data === "sys_download_worker_live") {
+                    const liveOnly = data === "sys_download_worker_live";
+                    await sendOrEdit(chatId, t("msg_preparing_download"), { inline_keyboard: [] }, messageId);
+                    const result = await fetchLiveWorkerCode(liveOnly);
+                    if (!result.code) {
+                        const errMsg = liveOnly ? `❌ ${result.error || t("msg_download_failed")}` : t("msg_download_failed");
+                        await sendOrEdit(chatId, errMsg, { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] });
+                        return new Response("OK", { status: 200 });
+                    }
+                    const form = new FormData();
+                    form.append("chat_id", chatId);
+                    form.append("caption", `_worker.js — v${CURRENT_VERSION} (${result.source})`);
+                    form.append("document", new Blob([result.code], { type: "application/javascript" }), `nahan_worker_${CURRENT_VERSION}.js`);
+                    await fetch(`${tgApi}/sendDocument`, { method: "POST", body: form });
+                    await sendOrEdit(chatId, t("msg_main_menu_return"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] });
+
+                } else if (data === "sys_upload_worker_init") {
+                    tgState[chatId] = { step: "upload_worker" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "panel_ops_menu" }]] };
+                    await sendOrEdit(chatId, t("msg_send_worker_file_or_url"), kb, messageId);
 
                 } else if (data.startsWith("sys_deploy_confirm:")) {
                     const latestVer = data.replace("sys_deploy_confirm:", "");
@@ -2410,7 +3047,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         inline_keyboard: [
                             [
                                 { text: t("btn_deploy_update"), callback_data: `sys_deploy_run:${latestVer}` },
-                                { text: t("btn_cancel"), callback_data: "main_menu" }
+                                { text: t("btn_cancel"), callback_data: "panel_ops_menu" }
                             ]
                         ]
                     };
@@ -2427,7 +3064,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         } else {
                             deployResultText = t("msg_deploy_failed").replace("{error}", (res && res.error) || "Unknown error");
                         }
-                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
                         await sendOrEdit(chatId, deployResultText, kb, messageId);
                         return new Response("OK", { status: 200 });
                     }
@@ -2444,6 +3081,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const deployResult = await deployRes.json();
                         if (deployResult.success) {
                             ctx?.waitUntil(logActivity(env, "Panel Updated", `v${CURRENT_VERSION} → v${newVersion} (via bot)`).catch(()=>{}));
+                            notifyPanelUpdatedTelegram(ctx, newVersion, "via bot");
                             deployResultText = t("msg_deploy_success").replace("{version}", newVersion);
                         } else {
                             const errMsg = deployResult.errors?.[0]?.message || "Unknown API error";
@@ -2452,7 +3090,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     } catch(e) {
                         deployResultText = t("msg_deploy_failed").replace("{error}", e.message);
                     }
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
                     await sendOrEdit(chatId, deployResultText, kb, messageId);
 
                 } else if (data === "sys_dashboard") {
@@ -2499,7 +3137,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
                     }
                     dashText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
                     await sendOrEdit(chatId, dashText, kb, messageId);
                 } else if (data === "sys_stats") {
                     let users, totalReqs, dailyReqs;
@@ -2545,7 +3183,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     }
                     const kb = { inline_keyboard: [
                             [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "sys_stats" }],
-                            [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                            [{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]
                         ] };
                     await sendOrEdit(chatId, statsText, kb, messageId);
                 } else if (data === "sys_panel_info") {
@@ -2563,14 +3201,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     }
                     infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
                     infoText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
                     await sendOrEdit(chatId, infoText, kb, messageId);
                 } else if (data.startsWith("subs_disabled:")) {
                     const panelUsers = await getPanelUsers();
                     const users = panelUsers || [];
                     const disabledUsers = users.filter(u => u.isPaused);
                     if (disabledUsers.length === 0) {
-                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "users_menu" }]] };
                         await sendOrEdit(chatId, `🚫 ${t("msg_no_disabled")}`, kb, messageId);
                     } else {
                         const page = parseInt(data.replace("subs_disabled:", "")) || 0;
@@ -2589,14 +3227,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (page > 0) navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_disabled:${page - 1}` });
                         if (end < disabledUsers.length) navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_disabled:${page + 1}` });
                         if (navRow.length > 0) inline_keyboard.push(navRow);
-                        inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                        inline_keyboard.push([{ text: `⬅️ ${t("btn_settings")}`, callback_data: "users_menu" }]);
                         await sendOrEdit(chatId, text, { inline_keyboard }, messageId);
                     }
                 } else if (data === "sub_search_init") {
                     tgState[chatId] = { step: "sub_search" };
                     ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                     const text = `🔍 ${t("msg_enter_search")}`;
-                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "users_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_reset_traffic:")) {
                     const uuid = data.replace("sub_reset_traffic:", "");
@@ -2669,7 +3307,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         return row;
                     });
                     kb_rows.push([{ text: `➕ ${t("add_panel")}`, callback_data: "add_panel_init" }]);
-                    kb_rows.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                    kb_rows.push([{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]);
                     await sendOrEdit(chatId, txt + t("select_panel"), { inline_keyboard: kb_rows }, messageId);
 
                 } else if (data.startsWith("panel_select:")) {
@@ -2677,7 +3315,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const allPanels = getPanelsList();
                     const chosen = allPanels[idx];
                     if (!chosen) {
-                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        await sendOrEdit(chatId, t("msg_panel_error"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                     } else {
                         const loginSignal = {
                             name: chosen.name,
@@ -2703,14 +3341,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const msg = langCode === "fa"
                         ? "🔌 آدرس پنل جدید را ارسال کنید:\n_(مثال: `myworker.workers.dev`)_"
                         : "🔌 Send the new panel URL:\n_(e.g. `myworker.workers.dev`)_";
-                    await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] }, messageId);
+                    await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "panel_ops_menu" }]] }, messageId);
 
                 } else if (data.startsWith("panel_remove_init:")) {
                     const idx = parseInt(data.replace("panel_remove_init:", ""));
                     const allPanels = getPanelsList();
                     const chosen = allPanels[idx];
                     if (!chosen || chosen.isLocal) {
-                        await sendOrEdit(chatId, "❌ Cannot remove local panel.", { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                        await sendOrEdit(chatId, "❌ Cannot remove local panel.", { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] }, messageId);
                     } else {
                         const langCode = sysConfig.tgBotLang || "fa";
                         const msg = langCode === "fa"
@@ -3006,7 +3644,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
                         if (results.length === 0) {
-                            const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                            const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "users_menu" }]] };
                             await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
                         } else {
                             let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
@@ -3016,7 +3654,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 searchText += `${statusEmoji} **${u.name}**\n`;
                                 inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
                             });
-                            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
+                            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "users_menu" }]);
                             await sendOrEdit(chatId, searchText, { inline_keyboard });
                         }
                         return new Response("OK", { status: 200 });
@@ -3098,6 +3736,25 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await sendOrEdit(chatId, `✅ ${t("config_limit_updated")}`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
+
+                    if (state.step === "upload_worker") {
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await sendOrEdit(chatId, t("msg_preparing_download"));
+                        let code = null;
+                        try {
+                            const res = await fetch(text);
+                            if (res.ok) code = await res.text();
+                        } catch (e) {}
+                        const result = await performWorkerUpload(env, ctx, code);
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
+                        if (result.success) {
+                            await sendOrEdit(chatId, `✅ ${t("msg_worker_updated")}`, kb);
+                        } else {
+                            await sendOrEdit(chatId, `❌ ${result.error}`, kb);
+                        }
+                        return new Response("OK", { status: 200 });
+                    }
                 }
 
                 // Default message / fallback menu
@@ -3105,6 +3762,37 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 await sendOrEdit(chatId, menu.text, menu.kb);
             } else {
                 await sendOrEdit(chatId, t("access_denied"));
+            }
+        } else if (update.message && update.message.document) {
+            const chatId = update.message.chat.id;
+            const doc = update.message.document;
+            if (!isAuthorized) {
+                await sendOrEdit(chatId, t("access_denied"));
+                return new Response("OK", { status: 200 });
+            }
+            const state = tgState[chatId];
+            if (state && state.step === "upload_worker") {
+                tgState[chatId] = null;
+                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                await sendOrEdit(chatId, t("msg_preparing_download"));
+                let code = null;
+                try {
+                    const fileRes = await fetch(`${tgApi}/getFile?file_id=${doc.file_id}`);
+                    const fileJson = await fileRes.json();
+                    if (fileJson.ok) {
+                        const filePath = fileJson.result.file_path;
+                        const fileUrl = `https://api.telegram.org/file/bot${sysConfig.tgToken}/${filePath}`;
+                        const contentRes = await fetch(fileUrl);
+                        if (contentRes.ok) code = await contentRes.text();
+                    }
+                } catch (e) {}
+                const result = await performWorkerUpload(env, ctx, code);
+                const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
+                if (result.success) {
+                    await sendOrEdit(chatId, `✅ ${t("msg_worker_updated")}`, kb);
+                } else {
+                    await sendOrEdit(chatId, `❌ ${result.error}`, kb);
+                }
             }
         }
         return new Response("OK", { status: 200 });
@@ -4660,8 +5348,18 @@ function getDashboardUI(hasDB) {
                               </button>
                           </div>
                       </div>
-                      <p id="err-msg" class="hidden text-sm mb-4 flex items-center gap-2 px-3 py-2.5 rounded-xl" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#f87171;"><span>&#9888;&#65039;</span><span data-i18n="err_pass">Wrong password, please try again.</span></p>
-                      <button onclick="doLogin()" class="btn-shimmer w-full py-3.5 rounded-2xl font-bold text-sm relative overflow-hidden transition-all" style="background:linear-gradient(135deg,#6366f1,#7c3aed);color:white;box-shadow:0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1);" onmouseover="this.style.boxShadow='0 6px 32px rgba(99,102,241,0.6),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(-1px)'" onmouseout="this.style.boxShadow='0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(0)'" data-i18n="login_btn">
+                      <p id="err-msg" class="hidden text-sm mb-4 flex items-center gap-2 px-3 py-2.5 rounded-xl" style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#f87171;"><span>&#9888;&#65039;</span><span id="err-msg-text" data-i18n="err_pass">Wrong password, please try again.</span></p>
+                      <div id="twofa-step" class="hidden mb-5">
+                          <label class="block text-sm font-semibold mb-2.5" style="color:#94a3b8;" id="twofa-label">Authenticator code</label>
+                          <input type="text" id="twofa-code" inputmode="numeric" maxlength="11" placeholder="123456" autocomplete="one-time-code" class="w-full px-4 py-3.5 text-center tracking-[0.3em] text-lg rounded-2xl outline-none transition-all" style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;">
+                          <div class="flex items-center justify-between mt-2.5">
+                              <label class="flex items-center gap-2 text-xs" style="color:#64748b;">
+                                  <input type="checkbox" id="twofa-remember" class="rounded"> <span id="twofa-remember-label">Trust this device for 30 days</span>
+                              </label>
+                              <button type="button" onclick="toggleRecoveryMode()" id="twofa-toggle-recovery" class="text-xs font-semibold" style="color:#818cf8;">Use recovery code instead</button>
+                          </div>
+                      </div>
+                      <button onclick="doLogin()" id="login-submit-btn" class="btn-shimmer w-full py-3.5 rounded-2xl font-bold text-sm relative overflow-hidden transition-all" style="background:linear-gradient(135deg,#6366f1,#7c3aed);color:white;box-shadow:0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1);" onmouseover="this.style.boxShadow='0 6px 32px rgba(99,102,241,0.6),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(-1px)'" onmouseout="this.style.boxShadow='0 4px 24px rgba(99,102,241,0.4),inset 0 1px 0 rgba(255,255,255,0.1)';this.style.transform='translateY(0)'" data-i18n="login_btn">
                           Sign In
                       </button>
                   </div>
@@ -5118,6 +5816,57 @@ function getDashboardUI(hasDB) {
                                       <button type="button" onclick="const n=document.getElementById('cfg-pass');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
                                   </div>
                               </div>
+                              <div class="space-y-1 md:col-span-2 border-t border-slate-100 dark:border-darkborder/50 pt-5 mt-1">
+                                  <div class="flex items-center justify-between mb-3">
+                                      <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1">🛡️ <span data-i18n="lbl_2fa">Two-Factor Authentication (2FA)</span></label>
+                                      <span id="twofa-status-badge" class="text-[10px] font-bold px-2 py-1 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800">…</span>
+                                  </div>
+
+                                  <div id="twofa-off-panel" class="hidden">
+                                      <p class="text-xs text-slate-500 dark:text-slate-400 mb-3" data-i18n="twofa_off_desc">Add a second layer of protection using any TOTP authenticator app (2FAS, Google Authenticator, Authy, Aegis...).</p>
+                                      <button type="button" onclick="twofaStartSetup()" class="px-4 py-2.5 bg-primary text-white text-xs font-bold rounded-xl hover:bg-primary/90 transition-colors" data-i18n="btn_enable_2fa">Enable 2FA</button>
+                                  </div>
+
+                                  <div id="twofa-setup-panel" class="hidden p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-darkborder space-y-3">
+                                      <p class="text-xs text-slate-500 dark:text-slate-400" data-i18n="twofa_setup_desc">Scan the QR code with your authenticator app, or enter the key manually, then type the 6-digit code it shows to confirm.</p>
+                                      <div class="flex flex-col items-center gap-2">
+                                          <img id="twofa-qr-img" class="w-40 h-40 rounded-xl border border-slate-200 dark:border-darkborder bg-white p-1" alt="QR code">
+                                          <p class="text-[10px] text-slate-400" data-i18n="twofa_qr_note">QR generated via a third-party image service (api.qrserver.com). Prefer not to use it? Enter the key below manually instead.</p>
+                                      </div>
+                                      <div class="space-y-1">
+                                          <label class="block text-xs font-bold text-slate-500">Manual key</label>
+                                          <div class="flex gap-2">
+                                              <input type="text" id="twofa-secret-display" readonly class="flex-1 px-3 py-2 rounded-lg border border-slate-200 dark:border-darkborder bg-white dark:bg-slate-900 font-mono text-xs">
+                                              <button type="button" onclick="copyToClipboard(document.getElementById('twofa-secret-display').value)" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 rounded-lg text-xs font-bold">Copy</button>
+                                          </div>
+                                      </div>
+                                      <div class="flex gap-2">
+                                          <input type="text" id="twofa-confirm-code" inputmode="numeric" maxlength="6" placeholder="123456" class="flex-1 px-3 py-2 rounded-lg border border-slate-200 dark:border-darkborder bg-white dark:bg-slate-900 font-mono text-center tracking-widest">
+                                          <button type="button" onclick="twofaConfirmSetup()" class="px-4 py-2 bg-emerald-500 text-white text-xs font-bold rounded-lg hover:bg-emerald-600" data-i18n="btn_confirm_2fa">Confirm & Enable</button>
+                                          <button type="button" onclick="twofaCancelSetup()" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 rounded-lg text-xs font-bold">✕</button>
+                                      </div>
+                                      <p id="twofa-setup-err" class="hidden text-xs text-rose-500"></p>
+                                  </div>
+
+                                  <div id="twofa-recovery-panel" class="hidden p-4 rounded-2xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40 space-y-2">
+                                      <p class="text-xs font-bold text-amber-700 dark:text-amber-400" data-i18n="twofa_recovery_title">⚠️ Save these recovery codes now — shown only once.</p>
+                                      <p class="text-[11px] text-amber-700/80 dark:text-amber-400/80" data-i18n="twofa_recovery_desc">If you lose access to your authenticator app, any of these one-time codes will let you log back in.</p>
+                                      <div id="twofa-recovery-codes" class="grid grid-cols-2 gap-1.5 font-mono text-xs"></div>
+                                      <div class="flex gap-2 pt-1">
+                                          <button type="button" onclick="twofaDownloadCodes()" class="px-3 py-2 bg-amber-500 text-white text-xs font-bold rounded-lg" data-i18n="btn_download_codes">Download codes</button>
+                                          <button type="button" onclick="document.getElementById('twofa-recovery-panel').classList.add('hidden')" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 rounded-lg text-xs font-bold" data-i18n="btn_done">Done</button>
+                                      </div>
+                                  </div>
+
+                                  <div id="twofa-on-panel" class="hidden space-y-2">
+                                      <p class="text-xs text-emerald-600 dark:text-emerald-400 font-semibold" data-i18n="twofa_on_desc">✅ 2FA is protecting this panel.</p>
+                                      <p class="text-[11px] text-slate-500" id="twofa-recovery-count">—</p>
+                                      <div class="flex flex-wrap gap-2">
+                                          <button type="button" onclick="twofaRegenerateCodes()" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 rounded-lg text-xs font-bold" data-i18n="btn_regen_codes">Regenerate recovery codes</button>
+                                          <button type="button" onclick="twofaDisable()" class="px-3 py-2 bg-rose-500/10 text-rose-500 border border-rose-500/30 rounded-lg text-xs font-bold" data-i18n="btn_disable_2fa">Disable 2FA</button>
+                                      </div>
+                                  </div>
+                              </div>
                               </div>
                               </div>
                           </div>
@@ -5158,14 +5907,29 @@ function getDashboardUI(hasDB) {
                               <div id="acc-b4" class="acc-body hidden px-6 pb-6">
                               <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                                   <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
-                                  <div class="flex flex-col sm:flex-row gap-4">
-                                      <button onclick="exportConfig()" class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
+                                  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+                                      <button onclick="exportConfig()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
                                           📥 Export Configuration (JSON)
                                       </button>
                                       <label class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm text-center cursor-pointer">
                                           <span data-i18n="import_btn">📤 Import Configuration (JSON)</span>
                                           <input type="file" id="import-file" class="hidden" accept=".json" onchange="importConfig(event)">
                                       </label>
+                                      <button onclick="downloadWorkerSource()" id="btn-download-worker" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="download_worker_btn">
+                                          🧩 Download Worker Source (_worker.js)
+                                      </button>
+                                      <button onclick="viewWorkerSource(false)" id="btn-view-worker" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_btn">
+                                          👁️ View Source Code (GitHub)
+                                      </button>
+                                      <button onclick="downloadWorkerSource(true)" id="btn-download-worker-live" class=" py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="download_worker_live_btn">
+                                          🌩️ Download Real Live Code (Cloudflare only)
+                                      </button>
+                                      <button onclick="viewWorkerSource(true)" id="btn-view-worker-live" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_live_btn">
+                                          👁️ View Real Live Code (Cloudflare)
+                                      </button>
+                                      <button onclick="openUploadWorkerModal()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="upload_worker_btn">
+                                          ⬆️ Upload / Update Worker
+                                      </button>
                                   </div>
                               </div>
                               </div>
@@ -5629,6 +6393,67 @@ function getDashboardUI(hasDB) {
                       </div>
 
                       <!-- Modal: Edit User -->
+                      <div id="modal-view-worker" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-4xl h-[85vh] sm:h-[80vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-3 shrink-0 flex items-center justify-between gap-3">
+                                  <div>
+                                      <h3 id="view-worker-title" class="text-xl font-bold" data-i18n="view_worker_title">Worker Source Code</h3>
+                                      <p id="view-worker-subtitle" class="text-xs text-slate-400 mt-1"></p>
+                                  </div>
+                                  <button onclick="copyWorkerSourceView()" id="btn-copy-worker-view" class="shrink-0 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-xs" data-i18n="btn_copy">📋 Copy</button>
+                              </div>
+                              <div class="overflow-auto flex-1 min-h-0 px-6 pb-4">
+                                  <pre id="view-worker-code" class="text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-all bg-slate-50 dark:bg-slate-900/60 rounded-2xl p-4 border border-slate-200 dark:border-darkborder"></pre>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-view-worker').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_close">Close</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
+                      <div id="modal-upload-worker" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="upload_worker_title">Upload / Update Worker</h3>
+                                  <p class="text-xs text-slate-400 mt-1" data-i18n="upload_worker_warning">⚠️ This will overwrite the currently deployed worker code. Make sure the source is correct.</p>
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-4">
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="upload_worker_url_lbl">File URL (e.g. raw GitHub link to _worker.js)</label>
+                                          <input type="url" id="upload-worker-url" placeholder="https://raw.githubusercontent.com/user/repo/main/_worker.js" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div class="flex items-center gap-2">
+                                          <div class="flex-1 h-px bg-slate-200 dark:bg-darkborder"></div>
+                                          <span class="text-[10px] text-slate-400" data-i18n="upload_worker_or">OR</span>
+                                          <div class="flex-1 h-px bg-slate-200 dark:bg-darkborder"></div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="upload_worker_file_lbl">Upload a .js File</label>
+                                          <input type="file" id="upload-worker-file" accept=".js,.txt,text/javascript,application/javascript,application/x-javascript,text/plain,*/*" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      </div>
+                                      <div class="flex items-center gap-2">
+                                          <div class="flex-1 h-px bg-slate-200 dark:bg-darkborder"></div>
+                                          <span class="text-[10px] text-slate-400" data-i18n="upload_worker_or">OR</span>
+                                          <div class="flex-1 h-px bg-slate-200 dark:bg-darkborder"></div>
+                                      </div>
+                                      <div>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="upload_worker_paste_lbl">Paste Code Directly</label>
+                                          <textarea id="upload-worker-code" rows="4" placeholder="// paste _worker.js content here" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono"></textarea>
+                                      </div>
+                                  </div>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-upload-worker').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button onclick="uploadWorkerSource()" id="btn-confirm-upload-worker" class="px-4 py-2 rounded-xl bg-red-500 hover:bg-red-600 text-white font-bold" data-i18n="upload_worker_deploy_btn">Deploy Now</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
                       <div id="modal-edit-user" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
                           <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
                               <div class="px-6 pt-6 pb-4 shrink-0">
@@ -6026,6 +6851,18 @@ function getDashboardUI(hasDB) {
                   lbl_u_max_config:"حداکثر تعداد کانفیگ",
                   lbl_u_max_conn:"حداکثر تعداد کانکشن هم‌زمان",
                   acc_b1_title:"پروتکل و پورت‌ها", acc_b2_title:"هویت و امنیت", acc_b3_title:"بروزرسانی و دسترسی", acc_b4_title:"پشتیبان‌گیری و بازیابی",
+                  download_worker_btn:"🧩 دانلود سورس ورکر (_worker.js)", download_worker_failed:"دانلود سورس ورکر ناموفق بود: ",
+                  download_worker_live_btn:"🌩️ دانلود کد واقعی (فقط کلودفلر)",
+                  view_worker_btn:"👁️ نمایش کد (گیت‌هاب)", view_worker_live_btn:"👁️ نمایش کد واقعی (کلودفلر)",
+                  view_worker_title:"کد سورس ورکر", view_worker_source_lbl:"منبع: ", view_worker_chars:"کاراکتر",
+                  btn_copy:"📋 کپی", btn_close:"بستن", copy_failed:"کپی ناموفق بود.",
+                  upload_worker_btn:"⬆️ آپلود / آپدیت ورکر", upload_worker_title:"آپلود / آپدیت ورکر",
+                  upload_worker_warning:"⚠️ این کار کد ورکر در حال اجرا رو بازنویسی می‌کنه. مطمئن شو سورس درسته.",
+                  upload_worker_url_lbl:"آدرس فایل (مثلاً لینک raw گیت‌هاب به _worker.js)", upload_worker_or:"یا",
+                  upload_worker_file_lbl:"آپلود فایل .js", upload_worker_paste_lbl:"چسباندن مستقیم کد",
+                  upload_worker_deploy_btn:"همین حالا دیپلوی کن", upload_worker_empty:"لطفاً یه آدرس، فایل یا کد وارد کن.",
+                  upload_worker_confirm:"این کار ورکر در حال اجرا رو بازنویسی می‌کنه. ادامه بدم؟",
+                  upload_worker_success:"ورکر با موفقیت آپدیت شد.", upload_worker_failed:"آپلود ناموفق بود: ",
                   acc_a1_title:"آی‌پی‌های پاک (چند سازنده)", acc_a2_title:"گره‌های برده (کلاستر)", acc_a3_title:"شبکه و امنیت TLS", acc_a4_title:"نام‌گذاری کانفیگ",
                   acc_a5_title:"سوییچ‌های عملکردی", acc_a6_title:"ربات تلگرام", acc_a7_title:"پنل‌های متصل", acc_a8_title:"آنالیتیکس کلودفلر",
                   login_password:"رمز ورود",
@@ -6616,6 +7453,123 @@ if (users.length > 0) {
               toast.style.transform = 'translate(-50%, 0)'; toast.style.opacity = '1';
               setTimeout(() => { toast.style.transform = 'translate(-50%, -5rem)'; toast.style.opacity = '0'; }, 2000);
           }
+
+          function copyToClipboard(text) {
+              navigator.clipboard.writeText(text || '');
+              const toast = document.getElementById('copy-toast');
+              if (toast) { toast.style.transform = 'translate(-50%, 0)'; toast.style.opacity = '1'; setTimeout(() => { toast.style.transform = 'translate(-50%, -5rem)'; toast.style.opacity = '0'; }, 2000); }
+          }
+
+          let lastRecoveryCodes = [];
+
+          async function twofaRefreshStatus() {
+              try {
+                  const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'status' }) });
+                  const data = await res.json();
+                  if (!data.success) return;
+                  const badge = document.getElementById('twofa-status-badge');
+                  const offPanel = document.getElementById('twofa-off-panel');
+                  const onPanel = document.getElementById('twofa-on-panel');
+                  const setupPanel = document.getElementById('twofa-setup-panel');
+                  setupPanel.classList.add('hidden');
+                  if (data.enabled) {
+                      badge.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'فعال' : 'ENABLED';
+                      badge.className = 'text-[10px] font-bold px-2 py-1 rounded-full bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400';
+                      offPanel.classList.add('hidden');
+                      onPanel.classList.remove('hidden');
+                      const countEl = document.getElementById('twofa-recovery-count');
+                      countEl.textContent = (typeof lang !== 'undefined' && lang === 'fa')
+                          ? (data.recoveryCodesRemaining + ' کد بازیابی باقیمانده · ' + data.trustedDevices + ' دستگاه مورد اعتماد')
+                          : (data.recoveryCodesRemaining + ' recovery codes left · ' + data.trustedDevices + ' trusted device(s)');
+                  } else {
+                      badge.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'غیرفعال' : 'DISABLED';
+                      badge.className = 'text-[10px] font-bold px-2 py-1 rounded-full bg-rose-100 text-rose-500 dark:bg-rose-900/30 dark:text-rose-400';
+                      onPanel.classList.add('hidden');
+                      offPanel.classList.remove('hidden');
+                  }
+              } catch (e) { /* ignore, panel just won't refresh */ }
+          }
+
+          async function twofaStartSetup() {
+              try {
+                  const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'init' }) });
+                  const data = await res.json();
+                  if (!data.success) { alert(data.error || 'Failed to start 2FA setup'); return; }
+                  document.getElementById('twofa-off-panel').classList.add('hidden');
+                  document.getElementById('twofa-setup-panel').classList.remove('hidden');
+                  document.getElementById('twofa-setup-err').classList.add('hidden');
+                  document.getElementById('twofa-secret-display').value = data.secret;
+                  document.getElementById('twofa-qr-img').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.otpauth);
+                  document.getElementById('twofa-confirm-code').value = '';
+              } catch (e) { alert('Network error starting 2FA setup'); }
+          }
+
+          function twofaCancelSetup() {
+              document.getElementById('twofa-setup-panel').classList.add('hidden');
+              document.getElementById('twofa-off-panel').classList.remove('hidden');
+          }
+
+          async function twofaConfirmSetup() {
+              const code = document.getElementById('twofa-confirm-code').value.trim();
+              const errEl = document.getElementById('twofa-setup-err');
+              try {
+                  const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'confirm', code }) });
+                  const data = await res.json();
+                  if (!data.success) {
+                      errEl.textContent = data.error || 'Invalid code, please try again.';
+                      errEl.classList.remove('hidden');
+                      return;
+                  }
+                  document.getElementById('twofa-setup-panel').classList.add('hidden');
+                  twofaShowRecoveryCodes(data.recoveryCodes);
+                  twofaRefreshStatus();
+              } catch (e) { errEl.textContent = 'Network error'; errEl.classList.remove('hidden'); }
+          }
+
+          function twofaShowRecoveryCodes(codes) {
+              lastRecoveryCodes = codes || [];
+              const panel = document.getElementById('twofa-recovery-panel');
+              const list = document.getElementById('twofa-recovery-codes');
+              list.innerHTML = lastRecoveryCodes.map(c => '<div class="px-2 py-1.5 bg-white dark:bg-slate-900 rounded-lg border border-amber-200 dark:border-amber-800/40 text-center">' + c + '</div>').join('');
+              panel.classList.remove('hidden');
+          }
+
+          function twofaDownloadCodes() {
+              if (!lastRecoveryCodes.length) return;
+              const text = 'Nahan Gateway - 2FA Recovery Codes\\nEach code can be used once if you lose access to your authenticator app.\\n\\n' + lastRecoveryCodes.join('\\n') + '\\n';
+              const blob = new Blob([text], { type: 'text/plain' });
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(blob);
+              a.download = 'nahan-2fa-recovery-codes.txt';
+              document.body.appendChild(a); a.click(); a.remove();
+          }
+
+          async function twofaRegenerateCodes() {
+              const code = prompt((typeof lang !== 'undefined' && lang === 'fa') ? 'برای تایید، کد فعلی اپلیکیشن احراز هویت را وارد کنید:' : 'Enter your current authenticator code to confirm:');
+              if (!code) return;
+              try {
+                  const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'regenerate_recovery', code }) });
+                  const data = await res.json();
+                  if (!data.success) { alert(data.error || 'Invalid code'); return; }
+                  twofaShowRecoveryCodes(data.recoveryCodes);
+                  twofaRefreshStatus();
+              } catch (e) { alert('Network error'); }
+          }
+
+          async function twofaDisable() {
+              const confirmMsg = (typeof lang !== 'undefined' && lang === 'fa') ? 'کد اپلیکیشن احراز هویت یا یکی از کدهای بازیابی را برای غیرفعال کردن 2FA وارد کنید:' : 'Enter your authenticator code or a recovery code to disable 2FA:';
+              const code = prompt(confirmMsg);
+              if (!code) return;
+              const isRecovery = /-/.test(code);
+              const payload = { key: sessionKey, action: 'disable' };
+              if (isRecovery) payload.recoveryCode = code.trim(); else payload.code = code.trim();
+              try {
+                  const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify(payload) });
+                  const data = await res.json();
+                  if (!data.success) { alert(data.error || 'Invalid code'); return; }
+                  twofaRefreshStatus();
+              } catch (e) { alert('Network error'); }
+          }
           
           function showQR(name, url) {
               document.getElementById('qr-modal-title').innerText = name;
@@ -6667,6 +7621,129 @@ if (users.length > 0) {
           }
   
           // Export active page inputs configuration
+          function openUploadWorkerModal() {
+              document.getElementById('upload-worker-url').value = '';
+              document.getElementById('upload-worker-file').value = '';
+              document.getElementById('upload-worker-code').value = '';
+              document.getElementById('modal-upload-worker').classList.remove('hidden');
+          }
+
+          async function uploadWorkerSource() {
+              const url = document.getElementById('upload-worker-url').value.trim();
+              const fileInput = document.getElementById('upload-worker-file');
+              const pastedCode = document.getElementById('upload-worker-code').value.trim();
+
+              if (!url && !fileInput.files[0] && !pastedCode) {
+                  alert(i18n[lang]?.upload_worker_empty || 'Please provide a URL, a file, or pasted code.');
+                  return;
+              }
+              if (!confirm(i18n[lang]?.upload_worker_confirm || 'This will overwrite the currently deployed worker. Continue?')) return;
+
+              const btn = document.getElementById('btn-confirm-upload-worker');
+              const originalHtml = btn.innerHTML;
+              btn.disabled = true;
+              btn.innerHTML = '⏳ ...';
+
+              try {
+                  let payload = {};
+                  if (fileInput.files[0]) {
+                      const fileText = await fileInput.files[0].text();
+                      payload = { code: fileText };
+                  } else if (pastedCode) {
+                      payload = { code: pastedCode };
+                  } else {
+                      payload = { url: url };
+                  }
+
+                  const res = await fetch(baseRoute + '/api/upload-worker', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sessionKey },
+                      body: JSON.stringify(payload)
+                  });
+                  const data = await res.json();
+                  if (!data.success) throw new Error(data.error || ('HTTP ' + res.status));
+
+                  alert(i18n[lang]?.upload_worker_success || 'Worker updated successfully.');
+                  document.getElementById('modal-upload-worker').classList.add('hidden');
+              } catch (e) {
+                  alert((i18n[lang]?.upload_worker_failed || 'Upload failed: ') + e.message);
+              } finally {
+                  btn.disabled = false;
+                  btn.innerHTML = originalHtml;
+              }
+          }
+
+          let _viewedWorkerCode = '';
+          async function viewWorkerSource(liveOnly) {
+              const btn = document.getElementById(liveOnly ? 'btn-view-worker-live' : 'btn-view-worker');
+              const originalHtml = btn.innerHTML;
+              btn.disabled = true;
+              btn.innerHTML = '⏳ ...';
+              try {
+                  const res = await fetch(baseRoute + '/api/download-worker' + (liveOnly ? '?source=live' : ''), {
+                      headers: { 'Authorization': 'Bearer ' + sessionKey }
+                  });
+                  if (!res.ok) {
+                      const errJson = await res.json().catch(() => ({}));
+                      throw new Error(errJson.error || ('HTTP ' + res.status));
+                  }
+                  const codeText = await res.text();
+                  const sourceLabel = res.headers.get('X-Worker-Source') || (liveOnly ? 'cloudflare' : 'auto');
+                  _viewedWorkerCode = codeText;
+                  document.getElementById('view-worker-code').textContent = codeText;
+                  document.getElementById('view-worker-subtitle').textContent =
+                      (i18n[lang]?.view_worker_source_lbl || 'Source: ') + sourceLabel + ' — ' + codeText.length + ' ' + (i18n[lang]?.view_worker_chars || 'characters');
+                  document.getElementById('modal-view-worker').classList.remove('hidden');
+              } catch (e) {
+                  alert((i18n[lang]?.download_worker_failed || 'Failed to load worker source: ') + e.message);
+              } finally {
+                  btn.disabled = false;
+                  btn.innerHTML = originalHtml;
+              }
+          }
+
+          function copyWorkerSourceView() {
+              if (!_viewedWorkerCode) return;
+              navigator.clipboard.writeText(_viewedWorkerCode).then(() => {
+                  const btn = document.getElementById('btn-copy-worker-view');
+                  const original = btn.innerHTML;
+                  btn.innerHTML = '✅';
+                  setTimeout(() => { btn.innerHTML = original; }, 1500);
+              }).catch(() => {
+                  alert(i18n[lang]?.copy_failed || 'Copy failed.');
+              });
+          }
+
+          async function downloadWorkerSource(liveOnly) {
+              const btn = document.getElementById(liveOnly ? 'btn-download-worker-live' : 'btn-download-worker');
+              const originalHtml = btn.innerHTML;
+              btn.disabled = true;
+              btn.innerHTML = '⏳ ...';
+              try {
+                  const res = await fetch(baseRoute + '/api/download-worker' + (liveOnly ? '?source=live' : ''), {
+                      headers: { 'Authorization': 'Bearer ' + sessionKey }
+                  });
+                  if (!res.ok) {
+                      const errJson = await res.json().catch(() => ({}));
+                      throw new Error(errJson.error || ('HTTP ' + res.status));
+                  }
+                  const blob = await res.blob();
+                  const dlUrl = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = dlUrl;
+                  a.download = '_worker.js';
+                  document.body.appendChild(a);
+                  a.click();
+                  a.remove();
+                  URL.revokeObjectURL(dlUrl);
+              } catch (e) {
+                  alert((i18n[lang]?.download_worker_failed || 'Failed to download worker source: ') + e.message);
+              } finally {
+                  btn.disabled = false;
+                  btn.innerHTML = originalHtml;
+              }
+          }
+
           function exportConfig() {
               const el = id => document.getElementById(id);
               const payload = {
@@ -6788,17 +7865,82 @@ if (users.length > 0) {
               });
           }
 
+          let recoveryModeActive = false;
+          function toggleRecoveryMode() {
+              recoveryModeActive = !recoveryModeActive;
+              const codeInput = document.getElementById('twofa-code');
+              const toggleBtn = document.getElementById('twofa-toggle-recovery');
+              const label = document.getElementById('twofa-label');
+              const rememberRow = document.getElementById('twofa-remember')?.closest('label');
+              if (recoveryModeActive) {
+                  codeInput.placeholder = 'XXXXX-XXXXX';
+                  codeInput.maxLength = 11;
+                  label.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'کد بازیابی' : 'Recovery code';
+                  toggleBtn.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'استفاده از کد اپلیکیشن' : 'Use authenticator code instead';
+                  if (rememberRow) rememberRow.style.display = 'none';
+              } else {
+                  codeInput.placeholder = '123456';
+                  codeInput.maxLength = 6;
+                  label.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'کد اپلیکیشن احراز هویت' : 'Authenticator code';
+                  toggleBtn.textContent = (typeof lang !== 'undefined' && lang === 'fa') ? 'استفاده از کد بازیابی' : 'Use recovery code instead';
+                  if (rememberRow) rememberRow.style.display = '';
+              }
+              codeInput.value = '';
+              codeInput.focus();
+          }
+
           async function doLogin(silent = false) {
-              const btn = document.querySelector('button[onclick="doLogin()"]');
-              const origText = btn.innerText; 
-              if(!silent) btn.innerText = "...";
+              const btn = document.getElementById('login-submit-btn');
+              const origText = btn ? btn.innerText : '';
+              if(!silent && btn) btn.innerText = "...";
+              const errMsg = document.getElementById('err-msg');
+              const twofaStep = document.getElementById('twofa-step');
               try {
+                  const cachedSession = (() => { try { return JSON.parse(localStorage.getItem('nahan_session') || 'null'); } catch(e) { return null; } })();
                   const pass = silent ? sessionKey : document.getElementById('pwd').value;
-                  const res = await fetch(baseRoute + '/api/auth', { method: 'POST', body: JSON.stringify({ key: pass }) });
+                  const trustToken = silent ? (cachedSession && cachedSession.trustToken) : (cachedSession && cachedSession.trustToken);
+                  const payload = { key: pass };
+                  if (silent) payload.silent = true;
+                  if (trustToken) payload.trustToken = trustToken;
+                  const twofaVisible = twofaStep && !twofaStep.classList.contains('hidden');
+                  if (twofaVisible) {
+                      const codeVal = document.getElementById('twofa-code').value.trim();
+                      if (recoveryModeActive) payload.recoveryCode = codeVal; else payload.totp = codeVal;
+                      payload.remember = document.getElementById('twofa-remember').checked;
+                  }
+                  const res = await fetch(baseRoute + '/api/auth', { method: 'POST', body: JSON.stringify(payload) });
                   const data = await res.json();
+
+                  if (!data.success && data.need2fa) {
+                      if (btn) btn.innerText = origText;
+                      if (twofaStep) twofaStep.classList.remove('hidden');
+                      if (errMsg) errMsg.classList.add('hidden');
+                      const codeEl = document.getElementById('twofa-code');
+                      if (codeEl) codeEl.focus();
+                      return;
+                  }
+                  if (!data.success && twofaVisible) {
+                      if (btn) btn.innerText = origText;
+                      if (errMsg) {
+                          document.getElementById('err-msg-text').textContent = recoveryModeActive
+                              ? ((typeof lang !== 'undefined' && lang === 'fa') ? 'کد بازیابی نامعتبر است.' : 'Invalid recovery code.')
+                              : ((typeof lang !== 'undefined' && lang === 'fa') ? 'کد وارد شده نادرست است.' : 'Invalid authenticator code.');
+                          errMsg.classList.remove('hidden');
+                      }
+                      return;
+                  }
+
                   if (data.success) {
-                      sessionKey = pass; localUUID = data.deviceId;
-                      localStorage.setItem('nahan_session', JSON.stringify({ key: pass, expiry: Date.now() + 30 * 60 * 1000 }));
+                      // Never keep the raw master key in the browser: the server hands
+                      // back a short-lived, revocable session token and that's the only
+                      // thing we persist or reuse for future requests.
+                      sessionKey = data.sessionToken || pass; localUUID = data.deviceId;
+                      localStorage.setItem('nahan_session', JSON.stringify({ key: sessionKey, trustToken: data.trustToken || (cachedSession && cachedSession.trustToken) || null, expiry: Date.now() + 30 * 60 * 1000 }));
+                      if (data.usedRecoveryCode && !silent) {
+                          setTimeout(() => alert((typeof lang !== 'undefined' && lang === 'fa')
+                              ? ('شما با یک کد بازیابی وارد شدید. ' + data.recoveryRemaining + ' کد دیگر باقی مانده است. برای امنیت بیشتر، از بخش تنظیمات کدهای بازیابی جدید بسازید.')
+                              : ('You logged in with a recovery code. ' + data.recoveryRemaining + ' codes remain. Please generate new recovery codes from Settings.')), 300);
+                      }
                       
                       document.getElementById('login-box').classList.add('hidden');
                       document.getElementById('dash-box').classList.remove('hidden');
@@ -6846,6 +7988,7 @@ if (users.length > 0) {
                       renderUsersTable();
                       renderLinkedPanels();
                       try { checkUpdate(); } catch(ue) { console.error(ue); }
+                      try { twofaRefreshStatus(); } catch(fe) { console.error(fe); }
                       if (!silent) switchTab('overview');
 
                       ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-nodes','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
@@ -8196,16 +9339,9 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
           }
 
           document.addEventListener('DOMContentLoaded', () => {
-              const cached = localStorage.getItem('nahan_session');
-              if(cached) {
-                  try {
-                      const session = JSON.parse(cached);
-                      if (Date.now() < session.expiry) {
-                          document.getElementById('pwd').value = session.key;
-                          doLogin(true);
-                      } else { localStorage.removeItem('nahan_session'); }
-                  } catch(e) { localStorage.removeItem('nahan_session'); }
-              }
+              // Auto-login (if any) is already handled by the earlier
+              // window 'DOMContentLoaded' listener using the stored session
+              // token; nothing further to do here.
           });
       </script>
   </body>
