@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.8.2";
+const CURRENT_VERSION = "2.8.3";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -220,7 +220,6 @@ function registerConnectionSlot(uuid, maxConn, webSocket) {
     webSocket.addEventListener('error', release);
     return true;
 }
-let uuidUsage = new Map();
 let activeDeviceId = "";
 
 let sysUsageCache = { users: {} };
@@ -415,7 +414,7 @@ function getTrojanHash(uuid) {
 function trackUsage(uuid, bytes, env, ctx) {
     if (!sysUsageCache) sysUsageCache = { users: {} };
     if (!sysUsageCache.users) sysUsageCache.users = {};
-    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0], connects: 0, last: 0 };
 
     let u = sysUsageCache.users[uuid];
     let today = new Date().toISOString().split('T')[0];
@@ -425,10 +424,17 @@ function trackUsage(uuid, bytes, env, ctx) {
     }
     if (u.reqs === undefined) u.reqs = 0;
     if (u.dReqs === undefined) u.dReqs = 0;
+    if (u.connects === undefined) u.connects = 0;
+    if (u.last === undefined) u.last = 0;
 
     if (bytes === 0) {
         u.reqs += 1;
         u.dReqs += 1;
+        // شمارش اتصال جدید و زمان آخرین اتصال؛ در sysUsageCache ذخیره می‌شود تا
+        // بین آیزوله‌های مختلف Cloudflare Workers مشترک و در D1 پایدار بماند
+        // (بر خلاف نقشه‌ی محلی قبلی که فقط در حافظه‌ی همان آیزوله معتبر بود).
+        u.connects += 1;
+        u.last = Date.now();
     }
 
     const now = Date.now();
@@ -1048,7 +1054,15 @@ async function loadSysConfig(env) {
 }
 
 async function fetchCloudflareUsage(accountId, apiToken) {
-    if (!accountId || !apiToken) return null;
+    const r = await fetchCloudflareUsageDetailed(accountId, apiToken);
+    return r.requests;
+}
+
+// نسخه‌ی تشخیصی: به‌جای برگرداندن فقط null در صورت خطا، دلیل واقعی شکست را هم
+// برمی‌گرداند (خطای HTTP، خطای GraphQL کلودفلر، یا نبود داده) تا در پنل قابل نمایش باشد
+// و به‌جای «—» ثابت و مبهم، بشود فهمید مشکل از کجاست (مثلاً پرمیشن ناقص توکن).
+async function fetchCloudflareUsageDetailed(accountId, apiToken) {
+    if (!accountId || !apiToken) return { requests: null, error: null };
     try {
         const d = new Date();
         const currentDate = d.toISOString().split('T')[0] + "T00:00:00Z";
@@ -1066,10 +1080,23 @@ async function fetchCloudflareUsage(accountId, apiToken) {
         });
 
         const json = await res.json();
+
+        if (!res.ok) {
+            const msg = json?.errors?.[0]?.message || `HTTP ${res.status}`;
+            return { requests: null, error: msg };
+        }
+        if (json?.errors?.length) {
+            return { requests: null, error: json.errors[0]?.message || "GraphQL error" };
+        }
+
         const reqs = json?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive?.[0]?.sum?.requests;
-        return typeof reqs === 'number' ? reqs : null;
+        if (typeof reqs !== 'number') {
+            // معمولاً یعنی accountId اشتباه است یا توکن دسترسی "Account Analytics" ندارد
+            return { requests: null, error: "no_data" };
+        }
+        return { requests: reqs, error: null };
     } catch(e) {
-        return null;
+        return { requests: null, error: e.message };
     }
 }
 
@@ -1613,8 +1640,13 @@ async function handleStatsApi(request, env) {
 
         // Cloudflare Workers request count for today, via the stored account/API token.
         let cfRequestsToday = null;
+        let cfError = null;
         const cfHasCreds = !!(sysConfig.cfAccountId && sysConfig.cfApiToken);
-        if (cfHasCreds) cfRequestsToday = await fetchCloudflareUsage(sysConfig.cfAccountId, sysConfig.cfApiToken);
+        if (cfHasCreds) {
+            const cfRes = await fetchCloudflareUsageDetailed(sysConfig.cfAccountId, sysConfig.cfApiToken);
+            cfRequestsToday = cfRes.requests;
+            cfError = cfRes.error;
+        }
 
         return new Response(JSON.stringify({
             success: true,
@@ -1623,9 +1655,9 @@ async function handleStatsApi(request, env) {
                 traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
                 system: { uptimeSeconds: upSeconds, activeConnections: liveActiveConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false },
                 connections: connectionsList,
-                cloudflare: { hasCredentials: cfHasCreds, requestsToday: cfRequestsToday }
+                cloudflare: { hasCredentials: cfHasCreds, requestsToday: cfRequestsToday, error: cfError }
             }
-        }), { headers: { "Content-Type": "application/json" } });
+        }), { headers: { "Content-Type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate" } });
     } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
 }
 
@@ -1851,8 +1883,26 @@ async function handleAuth(request, hostName, ctx, env) {
                 colo: request.cf?.colo || "Unknown",
                 loc: (request.cf?.city || "Unknown") + ", " + (request.cf?.country || "Unknown")
             };
+            // این باکس («وضعیت زنده») باید همان اتصالات واقعاً زنده‌ی الان را نشان بدهد،
+            // دقیقاً از همان منبعی که «کاربران متصل» در نمای کلی می‌خواند (جدول D1
+            // active_conns). قبلاً این بخش یا از یک Map محلیِ ناپایدار یا از شمارنده‌ی
+            // تجمعی تاریخی sysUsageCache می‌خواند که باعث ناهم‌خوانی با نمای کلی می‌شد.
             let usageData = {};
-            for(let [k,v] of uuidUsage.entries()) usageData[k] = v;
+            if (env.IOT_DB) {
+                const liveConnsForUsage = await d1GetActiveConns(env);
+                liveConnsForUsage.forEach(c => {
+                    if (!usageData[c.uuid]) usageData[c.uuid] = { connects: 0, last: 0 };
+                    usageData[c.uuid].connects += 1;
+                    if (c.connected_at > usageData[c.uuid].last) usageData[c.uuid].last = c.connected_at;
+                });
+            } else {
+                // بدون D1، اتصالات هم‌زمانِ آیزوله‌ی جاری به‌عنوان بهترین تخمین ممکن استفاده می‌شود
+                const sysUsers = (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {};
+                for (const k in sysUsers) {
+                    const su = sysUsers[k];
+                    if (su && su.connects) usageData[k] = { connects: su.connects, last: su.last || 0 };
+                }
+            }
             let baseHost = hostName;
             let protocol = "https";
             if (sysConfig.customPanelUrl && sysConfig.customPanelUrl.trim()) {
@@ -3856,11 +3906,6 @@ async function startDataPipe(webSocket, env, ctx) {
             activeProfile = matchedProfileAlpha;
             trackUsage(activeClientHash, 0, env, ctx);
 
-            let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(clientHash, uTrack);
-
             const optLen = view[17];
             const pPos = 18 + optLen + 1;
             targetPort = new DataView(bufferData.slice(pPos, pPos + 2)).getUint16(0);
@@ -3884,10 +3929,6 @@ async function startDataPipe(webSocket, env, ctx) {
             if (!registerConnectionSlot(activeClientHash, validProfile.maxConnections, webSocket)) return false; // DROP IF CONNECTION LIMIT REACHED
             activeProfile = validProfile;
             trackUsage(activeClientHash, 0, env, ctx);
-            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
-            uTrack.connects++;
-            uTrack.last = Date.now();
-            uuidUsage.set(activeClientHash, uTrack);
 
             let hPos = ePos + 2; hPos++;
             let aType = view[hPos]; hPos++; let aLen = 0;
@@ -5973,7 +6014,7 @@ function getDashboardUI(hasDB) {
                               <div class="relative">
                                   <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none scrollbar-hide text-slate-700 dark:text-slate-300 placeholder:text-indigo-200 dark:placeholder:text-indigo-800/50"></textarea>
                                   <div class="absolute bottom-3 end-3">
-                                      <button onclick="forceSyncNodes()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
+                                      <button onclick="openSyncModal()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
                                           <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                                           <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
                                       </button>
@@ -6356,6 +6397,75 @@ function getDashboardUI(hasDB) {
                                   <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-add-user').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
                                       <button onclick="commitAddUser()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="save_btn_user">Save User</button>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
+                      <!-- Modal: Force Sync Nodes - انتخاب بخش‌های ارسالی به نودهای دیگر -->
+                      <div id="modal-sync-nodes" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
+                          <div class="bg-white dark:bg-darkcard rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 dark:border-darkborder">
+                              <div class="px-6 pt-6 pb-4 shrink-0">
+                                  <h3 class="text-xl font-bold" data-i18n="modal_sync_title">Sync Settings to Nodes</h3>
+                                  <p class="text-xs text-slate-400 mt-1" data-i18n="modal_sync_desc">Choose which settings sections to push to the other panels.</p>
+                              </div>
+                              <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="space-y-3">
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-general" checked class="mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_general">General &amp; Network Settings</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_general_desc">Protocol, ports, DNS, fake SNI, relay, naming...</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-bot" onchange="syncGroupToggle('bot', this.checked)" class="mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_bot">Telegram Bot Settings</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_bot_desc">⚠ Overwrites the bot token/admin on other panels — may disrupt their bot.</span>
+                                          </span>
+                                      </label>
+                                      <div class="ms-8 -mt-2 space-y-1.5">
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-bot accent-primary" data-field="tgToken" onchange="syncChildChanged('bot')">
+                                              <span data-i18n="sync_field_tg_token">Bot Token</span>
+                                          </label>
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-bot accent-primary" data-field="tgChatId" onchange="syncChildChanged('bot')">
+                                              <span data-i18n="sync_field_tg_chat">Chat ID</span>
+                                          </label>
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-bot accent-primary" data-field="tgAdminId" onchange="syncChildChanged('bot')">
+                                              <span data-i18n="sync_field_tg_admin">Admin ID</span>
+                                          </label>
+                                      </div>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-cf" onchange="syncGroupToggle('cf', this.checked)" class="mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_cf">Cloudflare API Settings</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_cf_desc">⚠ Overwrites the account/token/worker name on other panels — may disrupt their deploy/stats.</span>
+                                          </span>
+                                      </label>
+                                      <div class="ms-8 -mt-2 space-y-1.5">
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-cf accent-primary" data-field="cfAccountId" onchange="syncChildChanged('cf')">
+                                              <span data-i18n="sync_field_cf_acc">Account ID</span>
+                                          </label>
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-cf accent-primary" data-field="cfApiToken" onchange="syncChildChanged('cf')">
+                                              <span data-i18n="sync_field_cf_token">API Token</span>
+                                          </label>
+                                          <label class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 cursor-pointer">
+                                              <input type="checkbox" class="sync-child-cf accent-primary" data-field="cfWorkerName" onchange="syncChildChanged('cf')">
+                                              <span data-i18n="sync_field_cf_worker">Worker Name</span>
+                                          </label>
+                                      </div>
+                                  </div>
+                              </div>
+                              <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
+                                  <div class="flex justify-end gap-2">
+                                      <button onclick="document.getElementById('modal-sync-nodes').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_cancel">Cancel</button>
+                                      <button onclick="confirmForceSync()" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="force_sync">Force Sync Now</button>
                                   </div>
                               </div>
                           </div>
@@ -6839,6 +6949,12 @@ function getDashboardUI(hasDB) {
                   lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
                   slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
                   force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
+                  modal_sync_title: "همگام‌سازی تنظیمات با نودها", modal_sync_desc: "انتخاب کن کدام بخش‌های تنظیمات برای نودهای دیگر ارسال شود.",
+                  sync_opt_general: "تنظیمات عمومی و شبکه", sync_opt_general_desc: "پروتکل، پورت‌ها، DNS، Fake SNI، رله، نام‌گذاری و...",
+                  sync_opt_bot: "تنظیمات ربات تلگرام", sync_opt_bot_desc: "⚠ توکن/ادمین ربات را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است ربات آن‌ها دچار اختلال شود.",
+                  sync_opt_cf: "تنظیمات API کلادفلر", sync_opt_cf_desc: "⚠ اکانت/توکن/نام Worker را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است دیپلوی یا آمار آن‌ها دچار اختلال شود.",
+                  sync_field_tg_token: "توکن ربات", sync_field_tg_chat: "چت آیدی", sync_field_tg_admin: "آیدی مدیر",
+                  sync_field_cf_acc: "شناسه اکانت", sync_field_cf_token: "توکن API", sync_field_cf_worker: "نام Worker",
                   limit_days: "مدت زمان اعتبار قانونی (روز) - برای نامحدود خالی بگذارید", edit_sub: "ویرایش مشترک", lbl_name_ph: "نام یا شناسه یکتا",
                   btn_save_changes: "ذخیره تغییرات", save_btn_user: "ثبت کاربر جدید", status_active: "فعال", status_paused: "متوقف شده", status_expired: "منقضی شده",
                   export_btn: "📥 برون‌بری فایل پیکربندی (نسخه پشتیبان)", import_btn: "📤 درون‌ریزی فایل پیکربندی (نسخه پشتیبان)",
@@ -7293,7 +7409,7 @@ function getDashboardUI(hasDB) {
         async function loadDashboard() {
             try {
                 const [statsRes, logsRes] = await Promise.all([
-                    fetch(baseRoute + '/api/stats', { method: 'GET', headers: { 'Authorization': 'Bearer ' + sessionKey } }),
+                    fetch(baseRoute + '/api/stats?t=' + Date.now(), { method: 'GET', headers: { 'Authorization': 'Bearer ' + sessionKey }, cache: 'no-store' }),
                     fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) })
                 ]);
                 const statsData = await statsRes.json();
@@ -7317,7 +7433,12 @@ function getDashboardUI(hasDB) {
                     const cfNoteEl = document.getElementById('ov-cf-requests-note');
                     if (s.cloudflare && s.cloudflare.hasCredentials) {
                         cfReqEl.textContent = s.cloudflare.requestsToday !== null ? s.cloudflare.requestsToday.toLocaleString() : '—';
-                        cfNoteEl.textContent = s.cloudflare.requestsToday !== null ? (lang === 'fa' ? 'از API کلودفلر' : 'via Cloudflare API') : (lang === 'fa' ? 'دریافت اطلاعات ناموفق بود' : 'fetch failed');
+                        if (s.cloudflare.requestsToday !== null) {
+                            cfNoteEl.textContent = lang === 'fa' ? 'از API کلودفلر' : 'via Cloudflare API';
+                        } else {
+                            const reason = s.cloudflare.error ? (': ' + s.cloudflare.error) : '';
+                            cfNoteEl.textContent = (lang === 'fa' ? 'دریافت اطلاعات ناموفق بود' : 'fetch failed') + reason;
+                        }
                     } else {
                         cfReqEl.textContent = '—';
                         cfNoteEl.textContent = lang === 'fa' ? 'شناسه اکانت/توکن تنظیم نشده' : 'Account ID/token not set';
@@ -8072,12 +8193,16 @@ if (users.length > 0) {
                           data.profiles.forEach(p => {
                               let hash = p.id.replace(/-/g, '').toLowerCase();
                               let use = data.usage[hash];
-                              if(use) {
-                                  let timeStr = new Date(use.last).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-                                  usageCont.innerHTML += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
+                              if(use && use.last) {
+                                  let timeStr = new Date(use.last).toLocaleString(
+                                      lang === 'fa' ? 'fa-IR' : 'en-US',
+                                      { hour12: false }
+                                  );
+                                  let connsLabel = lang === 'fa' ? 'اتصال' : 'Conns';
+                                  usageCont.innerHTML += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} \${connsLabel}</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
                               }
                           });
-                          if(usageCont.innerHTML === '') usageCont.innerHTML = '<p class="text-xs text-slate-400 text-center py-4">No active connection data yet.</p>';
+                          if(usageCont.innerHTML === '') usageCont.innerHTML = '<p class="text-xs text-slate-400 text-center py-4" data-i18n="no_metrics">' + (i18n[lang]?.no_metrics || 'No active connection data yet.') + '</p>';
                       }
                       
                       updateUI();
@@ -8128,39 +8253,76 @@ if (users.length > 0) {
               } catch(e) { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
           }
           
-          async function forceSyncNodes() {
+          function syncGroupToggle(group, checked) {
+              document.querySelectorAll('.sync-child-' + group).forEach(cb => cb.checked = checked);
+          }
+          function syncChildChanged(group) {
+              const children = Array.from(document.querySelectorAll('.sync-child-' + group));
+              const allChecked = children.every(cb => cb.checked);
+              const noneChecked = children.every(cb => !cb.checked);
+              const parent = document.getElementById('sync-opt-' + group);
+              parent.checked = allChecked;
+              parent.indeterminate = !allChecked && !noneChecked;
+          }
+
+          function openSyncModal() {
               const nodesRaw = document.getElementById('cfg-nodes').value;
               if (!nodesRaw || nodesRaw.trim() === '') {
                   const noSlaveMsg = lang === 'fa' ? 'هیچ نود فرعی مشخص نشده است.' : 'No slave nodes specified.';
                   alert(noSlaveMsg);
                   return;
               }
+              document.getElementById('modal-sync-nodes').classList.remove('hidden');
+          }
+
+          async function confirmForceSync() {
+              document.getElementById('modal-sync-nodes').classList.add('hidden');
+
               const btnTxt = document.getElementById('sync-btn-txt');
               const icon = document.getElementById('sync-icon');
-              
+
               btnTxt.innerText = 'Syncing...';
               icon.classList.add('animate-spin');
-              
+
               const el = id => document.getElementById(id);
-              const payload = {
-                  key: sessionKey,
-                  config: {
+              const includeGeneral = el('sync-opt-general').checked;
+
+              // فقط فیلدهای تیک‌خورده به payload اضافه می‌شن؛ چون گیرنده روی
+              // sysConfig موجودش spread می‌کنه، فیلدهایی که ارسال نمی‌شن دست‌نخورده
+              // باقی می‌مونن و پنل‌های دیگه دچار اختلال نمی‌شن.
+              let config = {};
+
+              if (includeGeneral) {
+                  Object.assign(config, {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                       resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
-                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
-                      cfWorkerName: el('cfg-cf-worker').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
                       subUserAgent: el('cfg-sub-ua').value,
                       customPanelUrl: el('cfg-custom-panel-url').value,
                       nameStrategy: el('cfg-name-strategy').value,
                       namePrefix: el('cfg-name-prefix').value
-                  }
+                  });
+              }
+
+              // هر زیرفیلد ربات/کلادفلر مستقل از بقیه انتخاب می‌شه (مثلاً فقط آیدی مدیر
+              // بدون توکن ربات) — نگاشت هر data-field به عنصر فرم منبعش:
+              const syncFieldElMap = {
+                  tgToken: 'cfg-tg-token', tgChatId: 'cfg-tg-chat', tgAdminId: 'cfg-tg-admin',
+                  cfAccountId: 'cfg-cf-acc', cfApiToken: 'cfg-cf-token', cfWorkerName: 'cfg-cf-worker'
               };
-              
+              document.querySelectorAll('.sync-child-bot, .sync-child-cf').forEach(cb => {
+                  if (cb.checked) {
+                      const field = cb.dataset.field;
+                      const srcId = syncFieldElMap[field];
+                      if (srcId) config[field] = el(srcId).value;
+                  }
+              });
+
+              const payload = { key: sessionKey, config };
+
               try {
                   const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
                   if (res.ok) {
