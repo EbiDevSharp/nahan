@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.8.3";
+const CURRENT_VERSION = "2.8.6";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -126,11 +126,13 @@ function generateRecoveryCodes(count = 10) {
 // the browser to hold the real password after the initial login.
 const SESSION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24h sliding window
 
-async function mintSessionToken(env, ctx) {
+async function mintSessionToken(env, ctx, request) {
     const token = base32Encode(crypto.getRandomValues(new Uint8Array(24)));
     const hash = await sha256Hex(token);
     const tokens = (sysConfig.sessionTokens || []).filter(t => t.expiry > Date.now());
-    tokens.push({ hash, expiry: Date.now() + SESSION_TOKEN_TTL_MS });
+    const ip = request ? (request.headers.get("cf-connecting-ip") || "Unknown") : "Unknown";
+    const ua = request ? (request.headers.get("user-agent") || "").slice(0, 120) : "";
+    tokens.push({ id: base32Encode(crypto.getRandomValues(new Uint8Array(8))), hash, createdAt: Date.now(), ip, ua, expiry: Date.now() + SESSION_TOKEN_TTL_MS });
     sysConfig = { ...sysConfig, sessionTokens: tokens };
     if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
     return token;
@@ -143,9 +145,17 @@ async function isKeyAuthorized(providedKey, env, ctx) {
     const tokens = sysConfig.sessionTokens || [];
     const match = tokens.find(t => t.hash === hash && t.expiry > Date.now());
     if (!match) return false;
-    // sliding expiry: extend the token's life while it's actively used
-    match.expiry = Date.now() + SESSION_TOKEN_TTL_MS;
-    if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+    // Sliding expiry: extend the token's life while it's actively used, but only
+    // actually persist that extension once the token is already past the halfway
+    // point of its TTL. Every authenticated request (dashboard loads fire several
+    // in parallel) would otherwise trigger its own full-config D1 write, which is
+    // wasteful and — since different requests can land on different isolates —
+    // can race and clobber each other's view of sessionTokens/trustedDevices.
+    const halfLife = Date.now() + SESSION_TOKEN_TTL_MS / 2;
+    if (match.expiry < halfLife) {
+        match.expiry = Date.now() + SESSION_TOKEN_TTL_MS;
+        if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+    }
     return true;
 }
 // --- end session-token helpers -----------------------------------------------
@@ -172,6 +182,7 @@ const SYSTEM_DEFAULTS = {
     tgToken: "",
     tgChatId: "",
     tgAdminId: "",
+    tgWebhookSecret: "",
     cfAccountId: "",
     cfApiToken: "",
     cfWorkerName: "",
@@ -1760,7 +1771,7 @@ async function handleUpdateApi(request, env, ctx) {
 
 // Checks the second factor for a login attempt once the master key has already
 // matched. Returns one of: { ok:true, trustToken?:string } | { ok:false, need2fa:true } | { ok:false }
-async function verifySecondFactor(data, env, ctx, ip) {
+async function verifySecondFactor(data, env, ctx, ip, ua) {
     if (!sysConfig.totpEnabled) return { ok: true };
 
     // 1) Trusted-device token (issued after a prior successful 2FA login with "remember" checked)
@@ -1780,7 +1791,7 @@ async function verifySecondFactor(data, env, ctx, ip) {
                 trustToken = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
                 const hash = await sha256Hex(trustToken);
                 const devices = (sysConfig.trustedDevices || []).filter(d => d.expiry > Date.now());
-                devices.push({ hash, expiry: Date.now() + 30 * 24 * 60 * 60 * 1000 });
+                devices.push({ id: base32Encode(crypto.getRandomValues(new Uint8Array(8))), hash, createdAt: Date.now(), ip: ip || "Unknown", ua: (ua || "").slice(0, 120), expiry: Date.now() + 30 * 24 * 60 * 60 * 1000 });
                 sysConfig = { ...sysConfig, trustedDevices: devices };
                 if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
             }
@@ -1821,7 +1832,7 @@ async function handleAuth(request, hostName, ctx, env) {
 
             if (isRawPassword) {
                 // Fresh login with the real master key still goes through the full 2FA gate.
-                const twoFa = await verifySecondFactor(data, env, ctx, ip);
+                const twoFa = await verifySecondFactor(data, env, ctx, ip, request.headers.get("user-agent") || "");
                 if (!twoFa.ok) {
                     if (twoFa.need2fa) {
                         return new Response(JSON.stringify({ success: false, need2fa: true }), { status: 401, headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } });
@@ -1876,7 +1887,7 @@ async function handleAuth(request, hostName, ctx, env) {
             // Fresh password logins mint a brand-new session token; a request that
             // already authenticated via a valid token just gets that same token back
             // (its sliding expiry was already extended inside isKeyAuthorized).
-            const sessionToken = isRawPassword ? await mintSessionToken(env, ctx) : data.key;
+            const sessionToken = isRawPassword ? await mintSessionToken(env, ctx, request) : data.key;
 
             const netInfo = {
                 ip: ip,
@@ -2043,6 +2054,66 @@ async function handleTwoFactorApi(request, env, ctx, hostName) {
             return new Response(JSON.stringify({ success: true, recoveryCodes }), { status: 200, headers: cors });
         }
 
+        if (action === "list_sessions") {
+            const now = Date.now();
+            const keyHash = await sha256Hex(data.key);
+            const sessions = (sysConfig.sessionTokens || []).filter(t => t.expiry > now).map(t => ({
+                id: t.id || t.hash.slice(0, 12), createdAt: t.createdAt || null, expiry: t.expiry,
+                ip: t.ip || "Unknown", ua: t.ua || "", current: t.hash === keyHash
+            })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            const devices = (sysConfig.trustedDevices || []).filter(d => d.expiry > now).map(d => ({
+                id: d.id || d.hash.slice(0, 12), createdAt: d.createdAt || null, expiry: d.expiry,
+                ip: d.ip || "Unknown", ua: d.ua || ""
+            })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            return new Response(JSON.stringify({ success: true, sessions, devices }), { status: 200, headers: cors });
+        }
+
+        if (action === "revoke_session") {
+            // The UI never shows an "End session" button for the current session,
+            // but guard it server-side too: revoking your own live token mid-request
+            // would immediately lock this same browser out with no warning.
+            const currentHash = await sha256Hex(data.key);
+            const targetIsCurrent = (sysConfig.sessionTokens || []).some(t => (t.id || t.hash.slice(0, 12)) === data.id && t.hash === currentHash);
+            if (targetIsCurrent) {
+                return new Response(JSON.stringify({ success: false, error: "Cannot end your own current session from here — log out instead." }), { status: 400, headers: cors });
+            }
+            const before = (sysConfig.sessionTokens || []).length;
+            const remaining = (sysConfig.sessionTokens || []).filter(t => (t.id || t.hash.slice(0, 12)) !== data.id);
+            sysConfig = { ...sysConfig, sessionTokens: remaining };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            if (remaining.length < before) ctx?.waitUntil(logActivity(env, "Session Revoked", `A web login session was ended from the Security panel`));
+            return new Response(JSON.stringify({ success: true }), { status: 200, headers: cors });
+        }
+
+        if (action === "revoke_device") {
+            const before = (sysConfig.trustedDevices || []).length;
+            const remaining = (sysConfig.trustedDevices || []).filter(d => (d.id || d.hash.slice(0, 12)) !== data.id);
+            sysConfig = { ...sysConfig, trustedDevices: remaining };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            if (remaining.length < before) ctx?.waitUntil(logActivity(env, "Trusted Device Forgotten", `A remembered 2FA device was removed from the Security panel`));
+            return new Response(JSON.stringify({ success: true }), { status: 200, headers: cors });
+        }
+
+        if (action === "revoke_all_sessions") {
+            // Keep the caller's own current session alive; end every other one.
+            const currentHash = await sha256Hex(data.key);
+            const before = (sysConfig.sessionTokens || []).length;
+            const remaining = (sysConfig.sessionTokens || []).filter(t => t.hash === currentHash);
+            sysConfig = { ...sysConfig, sessionTokens: remaining };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            const revokedCount = before - remaining.length;
+            if (revokedCount > 0) ctx?.waitUntil(logActivity(env, "All Sessions Revoked", `${revokedCount} other web login session(s) were ended from the Security panel`));
+            return new Response(JSON.stringify({ success: true, revokedCount }), { status: 200, headers: cors });
+        }
+
+        if (action === "revoke_all_devices") {
+            const before = (sysConfig.trustedDevices || []).length;
+            sysConfig = { ...sysConfig, trustedDevices: [] };
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            if (before > 0) ctx?.waitUntil(logActivity(env, "All Trusted Devices Forgotten", `${before} remembered 2FA device(s) were removed from the Security panel`));
+            return new Response(JSON.stringify({ success: true, revokedCount: before }), { status: 200, headers: cors });
+        }
+
         return new Response(JSON.stringify({ success: false, error: "Unknown action" }), { status: 400, headers: cors });
     } catch (e) {
         return new Response(JSON.stringify({ success: false, error: "Bad request" }), { status: 400, headers: cors });
@@ -2053,8 +2124,7 @@ async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
         const isAuthorized = (await isKeyAuthorized(data.key, env, ctx)) ||
-            (data.oldKey && data.oldKey === sysConfig.masterKey) ||
-            (sysConfig.masterKey === "admin");
+            (data.oldKey && data.oldKey === sysConfig.masterKey);
         if (!isAuthorized) return new Response(JSON.stringify({ success: false }), { status: 401 });
         if (data.fromMaster && !sysConfig.allowSyncWorker) {
             return new Response(JSON.stringify({ success: false, error: "Sync not allowed" }), { status: 403 });
@@ -2094,21 +2164,33 @@ async function handleConfigSync(request, env, ctx) {
             let currentHost = new URL(request.url).hostname;
             nodes.forEach(node => {
                 if(node !== currentHost) {
+                    // Only relay the fields actually submitted in THIS request (data.config),
+                    // not the full merged nextConfig — otherwise every save (including a
+                    // deliberately narrow Force Sync selection) would silently push the
+                    // entire local config (master key, users, everything) to every slave.
                     ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ key: nextConfig.masterKey, oldKey: oldMasterKey, config: nextConfig, fromMaster: true })
+                        body: JSON.stringify({ key: nextConfig.masterKey, oldKey: oldMasterKey, config: data.config, fromMaster: true })
                     }).catch(() => {}));
                 }
             });
         }
 
         if (nextConfig.tgToken && ctx) {
+            // اگه هنوز secret token برای وبهوک ساخته نشده، همین‌جا یکی می‌سازیم و ذخیره
+            // می‌کنیم. این توکن تضمین می‌کنه فقط خودِ سرورهای تلگرام (و نه هر کسی که
+            // آدرس وبهوک رو حدس بزنه) بتونن درخواست معتبر به این endpoint بفرستن.
+            if (!nextConfig.tgWebhookSecret) {
+                nextConfig.tgWebhookSecret = crypto.randomUUID().replace(/-/g, '');
+                sysConfig = nextConfig;
+                await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
+            }
             const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
             ctx.waitUntil(fetch(`https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: hookUrl })
+                body: JSON.stringify({ url: hookUrl, secret_token: nextConfig.tgWebhookSecret })
             }).catch(()=>{}));
         }
 
@@ -2247,7 +2329,7 @@ const botI18n = {
         msg_download_failed: "❌ Could not retrieve the worker source.",
         msg_main_menu_return: "✅ Done. Sent as a file above.",
         msg_worker_updated: "Worker updated successfully.",
-        msg_send_worker_file_or_url: "📤 Send the new _worker.js as a file, or send a direct URL to it as text.",
+        msg_send_worker_file_or_url: "📤 Send the new `_worker.js` as a file, or send a direct URL to it as text.",
         msg_update_check_failed: "❌ Failed to check for updates. Please try again later.",
         msg_no_update: "✅ You are already on the latest version (v{version}).",
         msg_update_available: "🆕 A new version is available!\n\n📦 Current: v{current}\n✨ Latest: v{latest}",
@@ -2358,7 +2440,7 @@ const botI18n = {
         msg_download_failed: "❌ دریافت سورس ورکر ممکن نشد.",
         msg_main_menu_return: "✅ انجام شد. فایل بالا ارسال شد.",
         msg_worker_updated: "ورکر با موفقیت آپدیت شد.",
-        msg_send_worker_file_or_url: "📤 فایل جدید _worker.js رو بفرست، یا آدرس مستقیمش رو به‌صورت متن ارسال کن.",
+        msg_send_worker_file_or_url: "📤 فایل جدید `_worker.js` رو بفرست، یا آدرس مستقیمش رو به‌صورت متن ارسال کن.",
         msg_update_check_failed: "❌ بررسی بروزرسانی ناموفق بود. لطفاً بعداً دوباره تلاش کنید.",
         msg_no_update: "✅ شما در حال استفاده از آخرین نسخه هستید (v{version}).",
         msg_update_available: "🆕 نسخه جدیدی موجود است!\n\n📦 نسخه فعلی: v{current}\n✨ آخرین نسخه: v{latest}",
@@ -2447,8 +2529,18 @@ async function remotePanelResetTraffic(panel, userId) {
 }
 
 async function handleTelegramWebhook(request, env, hostName, ctx) {
+    // اگه secret token ساخته شده (یعنی حداقل یه‌بار تنظیمات تلگرام ذخیره شده)،
+    // هر درخواستی که این هدر رو نداشته باشه یا مقدارش غلط باشه، قطعاً از سرور
+    // واقعی تلگرام نیومده و رد می‌شه. این جلوی جعل کامل «from.id» رو می‌گیره.
+    if (sysConfig.tgWebhookSecret) {
+        const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+        if (incomingSecret !== sysConfig.tgWebhookSecret) {
+            return new Response("Forbidden", { status: 403 });
+        }
+    }
+    let update = null;
     try {
-        const update = await request.json();
+        update = await request.json();
         const tgApi = `https://api.telegram.org/bot${sysConfig.tgToken}`;
 
         const langCode = sysConfig.tgBotLang || "fa";
@@ -2492,36 +2584,44 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
         // Custom sendOrEdit message helper
         const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
-            let res;
-            if (messageId) {
-                res = await fetch(`${tgApi}/editMessageText`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        message_id: messageId,
-                        text: text,
-                        parse_mode: 'Markdown',
-                        reply_markup: replyMarkup
-                    })
+            // اگه تلگرام به‌خاطر Markdown نامعتبر (مثلاً یه آندرلاین تک‌خورده مثل
+            // "_worker.js") پیام رو رد کنه، قبلاً هیچ fallback ای نبود و پیام کلاً
+            // بی‌صدا گم می‌شد — دقیقاً همون چیزی که دکمه رو "هیچ‌کاری نمی‌کنه" نشون می‌داد.
+            // حالا اگه نسخه Markdown رد بشه، همون متن رو به‌صورت ساده (بدون parse_mode)
+            // دوباره می‌فرستیم تا حداقل چیزی به ادمین برسه.
+            const attempt = async (useMarkdown) => {
+                let parseErr = false;
+                if (messageId) {
+                    const body = { chat_id: chatId, message_id: messageId, text: text, reply_markup: replyMarkup };
+                    if (useMarkdown) body.parse_mode = 'Markdown';
+                    const res = await fetch(`${tgApi}/editMessageText`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
+                    if (res.ok) return { res, parseErr: false };
+                    try {
+                        const errBody = await res.json();
+                        if (errBody?.description?.includes("message is not modified")) return { res, parseErr: false };
+                        if (useMarkdown && errBody?.description?.includes("can't parse entities")) parseErr = true;
+                    } catch (e) {}
+                    // any other edit failure (message deleted, too old, etc.) falls through to sendMessage below
+                }
+                const sendBody = { chat_id: chatId, text: text, reply_markup: replyMarkup };
+                if (useMarkdown) sendBody.parse_mode = 'Markdown';
+                const res = await fetch(`${tgApi}/sendMessage`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sendBody)
                 });
-                if (res.ok) return res;
-                try {
-                    const errBody = await res.json();
-                    if (errBody?.description?.includes("message is not modified")) return res;
-                } catch (e) {}
-            }
-            res = await fetch(`${tgApi}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: chatId,
-                    text: text,
-                    parse_mode: 'Markdown',
-                    reply_markup: replyMarkup
-                })
-            });
-            return res;
+                if (!res.ok && useMarkdown) {
+                    try {
+                        const errBody = await res.json();
+                        if (errBody?.description?.includes("can't parse entities")) parseErr = true;
+                    } catch (e) {}
+                }
+                return { res, parseErr };
+            };
+            const first = await attempt(true);
+            if (!first.parseErr) return first.res;
+            const second = await attempt(false);
+            return second.res;
         };
 
         const getMainMenu = (activePanel, isAdmin = true) => {
@@ -2793,7 +2893,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 // Clear step state on callback query
                 tgState[chatId] = null;
-                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
 
                 let answerText = null;
 
@@ -2901,21 +3001,21 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, successText, kb, messageId);
                 } else if (data === "sub_add_init") {
                     tgState[chatId] = { step: "sub_add_name" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `➕ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "subs_list:0" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_name_init:")) {
                     const uuid = data.replace("sub_edit_name_init:", "");
                     tgState[chatId] = { step: `sub_edit_name:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `✏️ ${t("msg_enter_name")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_limits_init:")) {
                     const uuid = data.replace("sub_edit_limits_init:", "");
                     tgState[chatId] = { step: `sub_edit_limits:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `⚙️ ${t("msg_enter_limits")}`;
                     const kb = {
                         inline_keyboard: [
@@ -2976,7 +3076,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
                     }
                     tgState[chatId] = null;
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                 } else if (data === "sys_panic_init") {
                     const text = `${t("msg_confirm_panic")}`;
                     const kb = {
@@ -3086,7 +3186,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 } else if (data === "sys_upload_worker_init") {
                     tgState[chatId] = { step: "upload_worker" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "panel_ops_menu" }]] };
                     await sendOrEdit(chatId, t("msg_send_worker_file_or_url"), kb, messageId);
 
@@ -3282,7 +3382,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     }
                 } else if (data === "sub_search_init") {
                     tgState[chatId] = { step: "sub_search" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `🔍 ${t("msg_enter_search")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "users_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
@@ -3308,21 +3408,21 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 } else if (data.startsWith("sub_extend_init:")) {
                     const uuid = data.replace("sub_extend_init:", "");
                     tgState[chatId] = { step: `sub_extend_days:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `📅 ${t("msg_enter_extend_days")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_notes_init:")) {
                     const uuid = data.replace("sub_edit_notes_init:", "");
                     tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `📝 ${t("msg_enter_notes")}`;
                     const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("sub_edit_device_init:")) {
                     const uuid = data.replace("sub_edit_device_init:", "");
                     tgState[chatId] = { step: `sub_edit_device:${uuid}` };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const text = `📱 ${t("msg_enter_device_limit")}`;
                     const kb = { inline_keyboard: [
                             [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
@@ -3386,7 +3486,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                 } else if (data === "add_panel_init") {
                     tgState[chatId] = { step: "add_panel_url" };
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const langCode = sysConfig.tgBotLang || "fa";
                     const msg = langCode === "fa"
                         ? "🔌 آدرس پنل جدید را ارسال کنید:\n_(مثال: `myworker.workers.dev`)_"
@@ -3433,6 +3533,18 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         body: JSON.stringify({ chat_id: chatId, text: `\`${subUrl}\``, parse_mode: 'Markdown' })
                     });
                     answerText = t("sub_link_sent");
+                } else {
+                    // قبلاً اگه callback_data با هیچ‌کدوم از شرط‌های بالا match نمی‌شد،
+                    // هیچ اتفاقی نمی‌افتاد و فقط toast عمومی "Done!" نشون داده می‌شد —
+                    // دقیقاً همون چیزی که باعث می‌شد به نظر برسه دکمه کار نمی‌کنه.
+                    // الان مقدار خام callback_data رو مستقیماً برای ادمین می‌فرستیم تا
+                    // مشخص بشه دقیقاً چی ارسال شده و چرا با هیچ حالتی مطابقت نداشته.
+                    answerText = "Unhandled: " + data;
+                    ctx?.waitUntil(fetch(`${tgApi}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: chatId, text: `⚠️ Unhandled button (callback_data): \`${data}\`` , parse_mode: 'Markdown' })
+                    }).catch(()=>{}));
                 }
 
                 ctx?.waitUntil(fetch(`${tgApi}/answerCallbackQuery`, {
@@ -3462,7 +3574,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 // Handle /start command
                 if (text === "/start") {
                     tgState[chatId] = null;
-                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                     const menu = getMainMenu(activePanel, isAuthorized);
                     await sendOrEdit(chatId, menu.text, menu.kb);
                     return new Response("OK", { status: 200 });
@@ -3473,7 +3585,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 if (state) {
                     if (!isAuthorized) {
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         await sendOrEdit(chatId, t("access_denied"));
                         return new Response("OK", { status: 200 });
                     }
@@ -3481,7 +3593,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step === "sub_add_name") {
                         const name = text;
                         tgState[chatId] = { step: "sub_add_limits", name: name };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
 
                         const msg = `⚙️ **${name}**\n\n${t("msg_enter_limits")}`;
                         const kb = {
@@ -3538,7 +3650,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         }
 
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         return new Response("OK", { status: 200 });
                     }
 
@@ -3554,7 +3666,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             }
                         }
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
 
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -3590,7 +3702,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             }
                         }
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
 
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
@@ -3602,7 +3714,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (state.step === "add_panel_url") {
                         const url = text.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
                         tgState[chatId] = { step: "add_panel_key", url };
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         const langCode = sysConfig.tgBotLang || "fa";
                         const msg = langCode === "fa"
                             ? `🔑 Master Key پنل \`${url}\` را ارسال کنید:`
@@ -3615,7 +3727,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const panelUrl = state.url;
                         const masterKey = text.trim();
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
 
                         // چک کردن پنل جدید
                         let verifyRes = null;
@@ -3692,7 +3804,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const users = panelUsers || [];
                         const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         if (results.length === 0) {
                             const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "users_menu" }]] };
                             await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
@@ -3736,7 +3848,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             }
                         }
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         const msg = t("msg_expiry_extended").replace("{days}", days);
@@ -3756,7 +3868,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             }
                         }
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
@@ -3780,7 +3892,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             }
                         }
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         const panelUsers = await getPanelUsers();
                         const detail = getSubDetail(uuid, panelUsers);
                         await sendOrEdit(chatId, `✅ ${t("config_limit_updated")}`, detail.kb);
@@ -3789,7 +3901,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
                     if (state.step === "upload_worker") {
                         tgState[chatId] = null;
-                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         await sendOrEdit(chatId, t("msg_preparing_download"));
                         let code = null;
                         try {
@@ -3823,30 +3935,67 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const state = tgState[chatId];
             if (state && state.step === "upload_worker") {
                 tgState[chatId] = null;
-                ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
-                await sendOrEdit(chatId, t("msg_preparing_download"));
-                let code = null;
-                try {
-                    const fileRes = await fetch(`${tgApi}/getFile?file_id=${doc.file_id}`);
-                    const fileJson = await fileRes.json();
-                    if (fileJson.ok) {
-                        const filePath = fileJson.result.file_path;
-                        const fileUrl = `https://api.telegram.org/file/bot${sysConfig.tgToken}/${filePath}`;
-                        const contentRes = await fetch(fileUrl);
-                        if (contentRes.ok) code = await contentRes.text();
-                    }
-                } catch (e) {}
-                const result = await performWorkerUpload(env, ctx, code);
+                await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                 const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "panel_ops_menu" }]] };
-                if (result.success) {
-                    await sendOrEdit(chatId, `✅ ${t("msg_worker_updated")}`, kb);
-                } else {
-                    await sendOrEdit(chatId, `❌ ${result.error}`, kb);
+                try {
+                    await sendOrEdit(chatId, t("msg_preparing_download"));
+                    let code = null;
+                    // قبلاً هر خطایی این‌جا کاملاً بی‌صدا catch می‌شد و کد null می‌ماند؛
+                    // الان دلیل واقعی شکست (پیام خطای خودِ تلگرام یا HTTP status) نگه داشته می‌شود
+                    // تا اگه دانلود فایل fail بشه، ادمین بفهمه چرا، نه اینکه فکر کنه دکمه کار نکرده.
+                    let fetchErrReason = null;
+                    try {
+                        const fileRes = await fetch(`${tgApi}/getFile?file_id=${doc.file_id}`);
+                        const fileJson = await fileRes.json();
+                        if (fileJson.ok) {
+                            const filePath = fileJson.result.file_path;
+                            const fileUrl = `https://api.telegram.org/file/bot${sysConfig.tgToken}/${filePath}`;
+                            const contentRes = await fetch(fileUrl);
+                            if (contentRes.ok) {
+                                code = await contentRes.text();
+                            } else {
+                                fetchErrReason = `Telegram file download HTTP ${contentRes.status}`;
+                            }
+                        } else {
+                            fetchErrReason = fileJson.description || "Telegram getFile failed";
+                        }
+                    } catch (fetchErr) {
+                        fetchErrReason = fetchErr.message;
+                    }
+
+                    if (!code) {
+                        await sendOrEdit(chatId, `❌ ${fetchErrReason || "No valid code provided."}`, kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    const result = await performWorkerUpload(env, ctx, code);
+                    if (result.success) {
+                        await sendOrEdit(chatId, `✅ ${t("msg_worker_updated")}`, kb);
+                    } else {
+                        await sendOrEdit(chatId, `❌ ${result.error}`, kb);
+                    }
+                } catch (outerErr) {
+                    // حتی اگه یه خطای غیرمنتظره‌ی دیگه هم رخ بده (مثلاً در performWorkerUpload یا sendOrEdit)،
+                    // دیگه کاملاً بی‌صدا نمی‌مونه — سعی می‌کنیم به ادمین اطلاع بدیم.
+                    try { await sendOrEdit(chatId, `❌ Error: ${outerErr.message}`, kb); } catch (_) {}
                 }
             }
         }
         return new Response("OK", { status: 200 });
     } catch(e) {
+        // قبلاً هر خطای پیش‌بینی‌نشده‌ای این‌جا کاملاً بی‌صدا بلعیده می‌شد و کاربر
+        // هیچ بازخوردی نمی‌گرفت (انگار دکمه کار نکرده). حالا حداقل تلاش می‌کنیم
+        // پیام خطا رو به همون چت برسونیم؛ اگه این تلاش هم fail بشه، مثل قبل سکوت می‌کنیم.
+        try {
+            const fallbackChatId = update?.callback_query?.message?.chat?.id || update?.message?.chat?.id;
+            if (fallbackChatId && sysConfig.tgToken) {
+                await fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ chat_id: fallbackChatId, text: `❌ Unexpected error: ${e.message}` })
+                }).catch(() => {});
+            }
+        } catch (_) {}
         return new Response("OK", { status: 200 });
     }
 }
@@ -4094,7 +4243,7 @@ function getAllProfiles(targetSub = null) {
                 if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, maxConnections: u.maxConnections || null, accessHourFrom: u.accessHourFrom || null, accessHourTo: u.accessHourTo || null });
+                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, maxConnections: u.maxConnections || null, accessHourFrom: u.accessHourFrom || null, accessHourTo: u.accessHourTo || null });
             }
         });
     }
@@ -5139,8 +5288,8 @@ function getDashboardUI(hasDB) {
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Nahan Gateway</title>
-      <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
       <link rel="icon" href="${FAVICON_URL}">
+      <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
       <script>
           tailwind.config = { 
@@ -5694,7 +5843,7 @@ function getDashboardUI(hasDB) {
                               <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-1">
                                   <svg class="w-8 h-8 text-blue-500 mb-4"  width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock10-icon lucide-clock-10"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l-4-2"/></svg>
                                   <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_datetime">Date Time</p>
-                                  <p id="net-datetime" class="text-lg font-bold truncate text-center"  dir="rtl">...</p>
+                                  <p id="net-datetime" class="text-lg font-bold truncate text-center">...</p>
                               </div>
                               <!-- Diagnostics Segment -->
                               <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-3">
@@ -5947,31 +6096,38 @@ function getDashboardUI(hasDB) {
                                   <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
                               </button>
                               <div id="acc-b4" class="acc-body hidden px-6 pb-6">
-                              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                              <div class="space-y-5">
                                   <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
-                                  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
-                                      <button onclick="exportConfig()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
-                                          📥 Export Configuration (JSON)
-                                      </button>
-                                      <label class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm text-center cursor-pointer">
-                                          <span data-i18n="import_btn">📤 Import Configuration (JSON)</span>
-                                          <input type="file" id="import-file" class="hidden" accept=".json" onchange="importConfig(event)">
-                                      </label>
-                                      <button onclick="downloadWorkerSource()" id="btn-download-worker" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="download_worker_btn">
-                                          🧩 Download Worker Source (_worker.js)
-                                      </button>
-                                      <button onclick="viewWorkerSource(false)" id="btn-view-worker" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_btn">
-                                          👁️ View Source Code (GitHub)
-                                      </button>
-                                      <button onclick="downloadWorkerSource(true)" id="btn-download-worker-live" class=" py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="download_worker_live_btn">
-                                          🌩️ Download Real Live Code (Cloudflare only)
-                                      </button>
-                                      <button onclick="viewWorkerSource(true)" id="btn-view-worker-live" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_live_btn">
-                                          👁️ View Real Live Code (Cloudflare)
-                                      </button>
-                                      <button onclick="openUploadWorkerModal()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="upload_worker_btn">
-                                          ⬆️ Upload / Update Worker
-                                      </button>
+                                  <div>
+                                      <h4 class="text-[11px] uppercase font-bold text-slate-400 tracking-wider mb-2" data-i18n="backup_grp_config">Configuration</h4>
+                                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                          <button onclick="exportConfig()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="export_btn">
+                                              📥 Export Configuration (JSON)
+                                          </button>
+                                          <label class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm text-center cursor-pointer">
+                                              <span data-i18n="import_btn">📤 Import Configuration (JSON)</span>
+                                              <input type="file" id="import-file" class="hidden" accept=".json" onchange="importConfig(event)">
+                                          </label>
+                                      </div>
+                                  </div>
+                                  <div>
+                                      <h4 class="text-[11px] uppercase font-bold text-slate-400 tracking-wider mb-2" data-i18n="backup_grp_worker">Worker Source</h4>
+                                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                          <button onclick="viewWorkerSource(false)" id="btn-view-worker" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_btn">
+                                              🧩 Worker Source (GitHub)
+                                          </button>
+                                          <button onclick="viewWorkerSource(true)" id="btn-view-worker-live" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="view_worker_live_btn">
+                                              🌩️ Worker Source (Live / Cloudflare)
+                                          </button>
+                                      </div>
+                                  </div>
+                                  <div>
+                                      <h4 class="text-[11px] uppercase font-bold text-slate-400 tracking-wider mb-2" data-i18n="backup_grp_deploy">Deploy</h4>
+                                      <div class="grid grid-cols-1 gap-3">
+                                          <button onclick="openUploadWorkerModal()" class="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm" data-i18n="upload_worker_btn">
+                                              ⬆️ Upload / Update Worker
+                                          </button>
+                                      </div>
                                   </div>
                               </div>
                               </div>
@@ -6340,59 +6496,76 @@ function getDashboardUI(hasDB) {
                                            <label class="block text-xs font-bold text-slate-500 mb-1">Custom Config Name / Prefix (Optional)</label>
                                            <input type="text" id="add-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
-                                          <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                        <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_limit_hour">Access Hours (Optional)</label>
-                                        <div class="flex gap-2 items-center">
-                                            <span class="text-xs text-slate-400 mb-1" data-i18n="limit_hour_from">From</span>
-                                            <input type="time" id="add-user-access-from" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                            <span class="text-slate-400" data-i18n="limit_hour_to">To</span>
-                                            <input type="time" id="add-user-access-to" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                        </div>
-                                    </div>
-                                      <div>
-    <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
-    <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                           <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Clean IPs (separated by commas or newlines)</label>
-                                           <textarea id="add-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
- </div>
- <div>
-    <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
-    <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                           <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Proxy IPs (separated by commas or newlines)</label>
-                                           <textarea id="add-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
- </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                          <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                      <div class="border border-slate-200 dark:border-darkborder rounded-xl overflow-hidden">
+                                          <button type="button" onclick="toggleAccordion('add-user-acc-limits')" class="acc-toggle w-full flex items-center justify-between gap-2 px-4 py-3 text-start bg-slate-50 dark:bg-slate-800/50">
+                                              <span class="flex items-center gap-2 text-xs font-bold text-slate-600 dark:text-slate-300 uppercase tracking-wider"><span>⏳</span><span data-i18n="grp_limits_title">Limits &amp; Access</span></span>
+                                              <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                          </button>
+                                          <div id="add-user-acc-limits" class="acc-body hidden px-4 pb-4 pt-1 space-y-4">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Traffic (GB) Limit (Leave empty for unlimited)</label>
+                                                  <input type="number" id="add-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
+                                                  <input type="number" id="add-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days) - Leave empty for unlimited</label>
+                                                  <input type="number" id="add-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_limit_hour">Access Hours (Optional)</label>
+                                                <div class="flex gap-2 items-center">
+                                                    <span class="text-xs text-slate-400 mb-1" data-i18n="limit_hour_from">From</span>
+                                                    <input type="time" id="add-user-access-from" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                                    <span class="text-slate-400" data-i18n="limit_hour_to">To</span>
+                                                    <input type="time" id="add-user-access-to" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                                </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
+                                                  <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
+                                                  <input type="number" min="0" id="add-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
                                           </div>
                                       </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                          <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                          <input type="number" id="add-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
-                                          <input type="number" min="0" id="add-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      <div class="border border-slate-200 dark:border-darkborder rounded-xl overflow-hidden">
+                                          <button type="button" onclick="toggleAccordion('add-user-acc-network')" class="acc-toggle w-full flex items-center justify-between gap-2 px-4 py-3 text-start bg-slate-50 dark:bg-slate-800/50">
+                                              <span class="flex items-center gap-2 text-xs font-bold text-slate-600 dark:text-slate-300 uppercase tracking-wider"><span>🌐</span><span data-i18n="grp_network_title">Network &amp; Protocol</span></span>
+                                              <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                          </button>
+                                          <div id="add-user-acc-network" class="acc-body hidden px-4 pb-4 pt-1 space-y-4">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
+                                                  <div id="add-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Clean IPs (separated by commas or newlines)</label>
+                                                  <textarea id="add-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
+                                                  <div id="add-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Proxy IPs (separated by commas or newlines)</label>
+                                                  <textarea id="add-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
+                                                  <div id="add-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="add-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="add-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
+                                                  <div id="add-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                          </div>
                                       </div>
                                   </div>
+
                               </div>
                               <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
                                   <div class="flex justify-end gap-2">
@@ -6411,12 +6584,93 @@ function getDashboardUI(hasDB) {
                                   <p class="text-xs text-slate-400 mt-1" data-i18n="modal_sync_desc">Choose which settings sections to push to the other panels.</p>
                               </div>
                               <div class="overflow-y-auto flex-1 min-h-0 px-6 pb-4">
+                                  <div class="flex justify-end gap-3 mb-2 text-[11px] font-bold">
+                                      <button type="button" onclick="syncSelectAll(true)" class="text-primary hover:underline" data-i18n="modal_sync_select_all">Select all</button>
+                                      <button type="button" onclick="syncSelectAll(false)" class="text-slate-400 hover:underline" data-i18n="modal_sync_select_none">Select none</button>
+                                  </div>
                                   <div class="space-y-3">
                                       <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
-                                          <input type="checkbox" id="sync-opt-general" checked class="mt-0.5 accent-primary shrink-0">
+                                          <input type="checkbox" id="sync-opt-ports" checked class="sync-simple mt-0.5 accent-primary shrink-0">
                                           <span>
-                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_general">General &amp; Network Settings</span>
-                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_general_desc">Protocol, ports, DNS, fake SNI, relay, naming...</span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_ports">Protocol &amp; Ports</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_ports_desc">Display mode and active ports.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-network" checked class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_network">TLS &amp; Network</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_network_desc">TLS signature, DNS, fake SNI hosts, backup relay IPs.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-cleanips" checked class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_cleanips">Clean IPs</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_cleanips_desc">The clean/CDN IP list used to build configs.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-naming" checked class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_naming">Config Naming</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_naming_desc">Naming strategy and custom prefix.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-update" checked class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_update">Update &amp; Access</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_update_desc">GitHub update repo and subscription User-Agent bypass.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-toggles" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_toggles">Toggles &amp; Switches</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_toggles_desc">⚠ Includes the Kill Switch — may pause the other panels' traffic.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-domain" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_domain">Custom Panel Domain</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_domain_desc">⚠ Each panel usually has its own domain — sync only if they intentionally share one.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-identity" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_identity">Identity (UUID &amp; API Route)</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_identity_desc">⚠ Changes the target panel's hidden path and device UUID — old links/bookmarks on that panel will break.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-users" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_users">Users</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_users_desc">⚠ Replaces the ENTIRE subscriber list on the other panels with this one's — their own users will be deleted.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-security" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_security">Security (Master Key)</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_security_desc">⚠ Overwrites the login password on the other panels.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <input type="checkbox" id="sync-opt-cluster" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_cluster">Slave Node List</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_cluster_desc">⚠ Overwrites which nodes the target treats as ITS slaves — can create sync loops. Leave unchecked unless you mean it.</span>
+                                          </span>
+                                      </label>
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder opacity-60 cursor-not-allowed">
+                                          <input type="checkbox" disabled class="mt-0.5 accent-primary shrink-0">
+                                          <span>
+                                              <span class="block text-sm font-bold text-slate-500 dark:text-slate-400" data-i18n="sync_opt_twofa">Two-Factor Authentication</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_twofa_desc">Not syncable: the panel deliberately never sends your 2FA secret to the browser, so it can't be replicated from here.</span>
                                           </span>
                                       </label>
                                       <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
@@ -6514,11 +6768,12 @@ function getDashboardUI(hasDB) {
                                   <button onclick="copyWorkerSourceView()" id="btn-copy-worker-view" class="shrink-0 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-xs" data-i18n="btn_copy">📋 Copy</button>
                               </div>
                               <div class="overflow-auto flex-1 min-h-0 px-6 pb-4">
-                                  <pre id="view-worker-code" class="text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-all bg-slate-50 dark:bg-slate-900/60 rounded-2xl p-4 border border-slate-200 dark:border-darkborder"></pre>
+                                  <pre id="view-worker-code" dir="ltr" class="text-[11px] leading-relaxed text-start font-mono whitespace-pre-wrap break-all bg-slate-50 dark:bg-slate-900/60 rounded-2xl p-4 border border-slate-200 dark:border-darkborder"></pre>
                               </div>
                               <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
                                   <div class="flex justify-end gap-2">
                                       <button onclick="document.getElementById('modal-view-worker').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold" data-i18n="btn_close">Close</button>
+                                      <button onclick="downloadViewedWorkerSource()" id="btn-download-worker-view" class="px-4 py-2 rounded-xl bg-primary text-white font-bold" data-i18n="btn_download">⬇️ Download</button>
                                   </div>
                               </div>
                           </div>
@@ -6552,7 +6807,7 @@ function getDashboardUI(hasDB) {
                                       </div>
                                       <div>
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="upload_worker_paste_lbl">Paste Code Directly</label>
-                                          <textarea id="upload-worker-code" rows="4" placeholder="// paste _worker.js content here" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono"></textarea>
+                                          <textarea id="upload-worker-code" dir="ltr" rows="4" placeholder="// paste _worker.js content here" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono text-start"></textarea>
                                       </div>
                                   </div>
                               </div>
@@ -6581,57 +6836,73 @@ function getDashboardUI(hasDB) {
                                            <label class="block text-xs font-bold text-slate-500 mb-1">Custom Config Name / Prefix (Optional)</label>
                                            <input type="text" id="edit-user-custom-name" placeholder="Leave empty to use user name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="edit-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
-                                          <input type="number" id="edit-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
-                                          <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                                      </div>
-                                         <div>
-                                        <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_limit_hour">Access Hours (Optional)</label>
-                                        <div class="flex gap-2 items-center">
-                                            <span class="text-xs text-slate-400 mb-1" data-i18n="limit_hour_from">From</span>
-                                            <input type="time" id="edit-user-access-from" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                            <span class="text-slate-400" data-i18n="limit_hour_to">To</span>
-                                            <input type="time" id="edit-user-access-to" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                        </div>
-                                    </div>
-                                      <div>
-    <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
-    <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                           <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Clean IPs (separated by commas or newlines)</label>
-                                           <textarea id="edit-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
- </div>
- <div>
-    <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
-    <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
-                                           <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Proxy IPs (separated by commas or newlines)</label>
-                                           <textarea id="edit-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
- </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
-                                          <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
-                                              <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                      <div class="border border-slate-200 dark:border-darkborder rounded-xl overflow-hidden">
+                                          <button type="button" onclick="toggleAccordion('edit-user-acc-limits')" class="acc-toggle w-full flex items-center justify-between gap-2 px-4 py-3 text-start bg-slate-50 dark:bg-slate-800/50">
+                                              <span class="flex items-center gap-2 text-xs font-bold text-slate-600 dark:text-slate-300 uppercase tracking-wider"><span>⏳</span><span data-i18n="grp_limits_title">Limits &amp; Access</span></span>
+                                              <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                          </button>
+                                          <div id="edit-user-acc-limits" class="acc-body hidden px-4 pb-4 pt-1 space-y-4">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_total">Total Requests Limit (Leave empty for unlimited)</label>
+                                                  <input type="number" id="edit-user-total-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_daily">Daily Requests Limit (Leave empty for unlimited)</label>
+                                                  <input type="number" id="edit-user-daily-reqs" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="limit_days">Expiration limit (Days remaining) - Leave empty for unlimited</label>
+                                                  <input type="number" id="edit-user-days" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                                              </div>
+                                              <div>
+                                                <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_limit_hour">Access Hours (Optional)</label>
+                                                <div class="flex gap-2 items-center">
+                                                    <span class="text-xs text-slate-400 mb-1" data-i18n="limit_hour_from">From</span>
+                                                    <input type="time" id="edit-user-access-from" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                                    <span class="text-slate-400" data-i18n="limit_hour_to">To</span>
+                                                    <input type="time" id="edit-user-access-to" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                                </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
+                                                  <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
+                                                  <input type="number" min="0" id="edit-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                              </div>
                                           </div>
                                       </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
-                                          <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_config">Max Configs (Optional - limit total generated configs, e.g. 4)</label>
-                                          <input type="number" id="edit-user-max-configs" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
-                                      </div>
-                                      <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_max_conn">Max Concurrent Connections (Optional, e.g. 2)</label>
-                                          <input type="number" min="0" id="edit-user-max-connections" placeholder="Leave empty for unlimited" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                      <div class="border border-slate-200 dark:border-darkborder rounded-xl overflow-hidden">
+                                          <button type="button" onclick="toggleAccordion('edit-user-acc-network')" class="acc-toggle w-full flex items-center justify-between gap-2 px-4 py-3 text-start bg-slate-50 dark:bg-slate-800/50">
+                                              <span class="flex items-center gap-2 text-xs font-bold text-slate-600 dark:text-slate-300 uppercase tracking-wider"><span>🌐</span><span data-i18n="grp_network_title">Network &amp; Protocol</span></span>
+                                              <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                          </button>
+                                          <div id="edit-user-acc-network" class="acc-body hidden px-4 pb-4 pt-1 space-y-4">
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Select Clean IPs</label>
+                                                  <div id="edit-user-clean-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Clean IPs (separated by commas or newlines)</label>
+                                                  <textarea id="edit-user-custom-clean" rows="1" placeholder="e.g. 1.2.3.4, 5.6.7.8" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1">Select Proxy IPs</label>
+                                                  <div id="edit-user-proxy-ips-wrap" class="flex flex-wrap gap-2 mt-1 text-slate-500"></div>
+                                                  <label class="block text-[10px] font-bold text-slate-400 mt-2">Or enter Custom Proxy IPs (separated by commas or newlines)</label>
+                                                  <textarea id="edit-user-custom-proxy" rows="1" placeholder="e.g. proxy1.com:443" class="w-full mt-1 px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm"></textarea>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_Protocol">Protocol Mode</label>
+                                                  <div id="edit-user-mode-wrap" class="flex gap-3 mt-1">
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="alpha" class="edit-mode-cb accent-primary"> <span>Alpha (VLESS)</span></label>
+                                                      <label class="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" value="beta" class="edit-mode-cb accent-primary"> <span>Beta (Trojan)</span></label>
+                                                  </div>
+                                              </div>
+                                              <div>
+                                                  <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_u_ports">Ports</label>
+                                                  <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
+                                              </div>
+                                          </div>
                                       </div>
                                   </div>
                               </div>
@@ -6646,15 +6917,45 @@ function getDashboardUI(hasDB) {
 
                       <!-- LOGS VIEW -->
                       <div id="view-logs" class="hidden space-y-6">
-                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
-                              <div class="flex items-center justify-between mb-6">
-                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider">System Activity Logs</h3>
-                                  <button onclick="loadLogs()" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-bold transition-colors">
-                                      🔄 Refresh
-                                  </button>
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-logs')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">📜</span><span data-i18n="acc_logs_title">System Activity Logs</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0 rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-logs" class="acc-body px-6 pb-6">
+                                  <div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-4">
+                                      <select id="logs-filter-type" onchange="renderFilteredLogs()" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 text-xs font-bold outline-none focus:border-primary">
+                                          <option value="" data-i18n="logs_filter_all">All types</option>
+                                      </select>
+                                      <input type="text" id="logs-filter-search" oninput="renderFilteredLogs()" data-i18n-ph="logs_filter_search_ph" placeholder="Search in details..." class="flex-1 px-3 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 text-xs outline-none focus:border-primary">
+                                      <button onclick="loadLogs()" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl text-xs font-bold transition-colors shrink-0">
+                                          🔄 <span data-i18n="btn_refresh">Refresh</span>
+                                      </button>
+                                  </div>
+                                  <div class="space-y-3" id="logs-container">
+                                      <p class="text-sm text-slate-400 text-center py-8" data-i18n="logs_loading">Loading activity logs...</p>
+                                  </div>
                               </div>
-                              <div class="space-y-3" id="logs-container">
-                                  <p class="text-sm text-slate-400 text-center py-8">Loading activity logs...</p>
+                          </div>
+                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
+                              <button type="button" onclick="toggleAccordion('acc-sessions'); loadSessions();" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
+                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">💻</span><span data-i18n="acc_sessions_title">Web Logins (Active Devices)</span></span>
+                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                              </button>
+                              <div id="acc-sessions" class="acc-body hidden px-6 pb-6">
+                                  <p class="text-xs text-slate-400 mb-4" data-i18n="sessions_desc">Every browser currently logged into this panel, and every device remembered for 2FA. End any of them to force a fresh login there.</p>
+                                  <div class="flex items-center justify-between mb-2">
+                                      <h4 class="text-xs uppercase font-bold text-slate-400 tracking-wider" data-i18n="sessions_active_title">Active Sessions</h4>
+                                      <button type="button" onclick="revokeAllSessions()" id="btn-revoke-all-sessions" class="hidden text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-500 border border-rose-500/30 hover:bg-rose-500/20 shrink-0" data-i18n="btn_end_all_sessions">End all other sessions</button>
+                                  </div>
+                                  <div class="space-y-2 mb-5" id="sessions-container">
+                                      <p class="text-sm text-slate-400 text-center py-4" data-i18n="logs_loading">Loading...</p>
+                                  </div>
+                                  <div class="flex items-center justify-between mb-2">
+                                      <h4 class="text-xs uppercase font-bold text-slate-400 tracking-wider" data-i18n="sessions_trusted_title">Trusted 2FA Devices</h4>
+                                      <button type="button" onclick="revokeAllDevices()" id="btn-revoke-all-devices" class="hidden text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-500 border border-rose-500/30 hover:bg-rose-500/20 shrink-0" data-i18n="btn_forget_all_devices">Forget all devices</button>
+                                  </div>
+                                  <div class="space-y-2" id="trusted-devices-container"></div>
                               </div>
                           </div>
                       </div>
@@ -6918,6 +7219,10 @@ function getDashboardUI(hasDB) {
                     btn_redeploy_force: "Force Redeploy / Switch Format",
                    update_requires_cf: "Set CF Account ID, API Token, and Worker Name to enable in-panel deploy.",
                    html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
+                   acc_logs_title: "System Activity Logs", logs_filter_all: "All types", logs_filter_search_ph: "Search in details...", logs_loading: "Loading...",
+                   acc_sessions_title: "Web Logins (Active Devices)", sessions_desc: "Every browser currently logged into this panel, and every device remembered for 2FA. End any of them to force a fresh login there.",
+                   sessions_active_title: "Active Sessions", sessions_trusted_title: "Trusted 2FA Devices", sessions_none: "No active sessions.", sessions_no_trusted: "No remembered devices.", btn_end_all_sessions: "End all other sessions", btn_forget_all_devices: "Forget all devices", grp_limits_title: "Limits & Access", grp_network_title: "Network & Protocol",
+                   btn_end_session: "End session", btn_forget_device: "Forget device",
                },
               fa: {
                   title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
@@ -6951,7 +7256,19 @@ function getDashboardUI(hasDB) {
                   slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
                   force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
                   modal_sync_title: "همگام‌سازی تنظیمات با نودها", modal_sync_desc: "انتخاب کن کدام بخش‌های تنظیمات برای نودهای دیگر ارسال شود.",
-                  sync_opt_general: "تنظیمات عمومی و شبکه", sync_opt_general_desc: "پروتکل، پورت‌ها، DNS، Fake SNI، رله، نام‌گذاری و...",
+                  modal_sync_select_all: "انتخاب همه", modal_sync_select_none: "لغو انتخاب همه",
+                  sync_opt_ports: "پروتکل و پورت‌ها", sync_opt_ports_desc: "حالت نمایش و پورت‌های فعال.",
+                  sync_opt_network: "شبکه و TLS", sync_opt_network_desc: "امضای TLS، DNS، هاست‌های Fake SNI، آی‌پی‌های رله پشتیبان.",
+                  sync_opt_cleanips: "آی‌پی‌های تمیز", sync_opt_cleanips_desc: "فهرست آی‌پی تمیز/CDN مورد استفاده برای ساخت کانفیگ‌ها.",
+                  sync_opt_naming: "نام‌گذاری کانفیگ", sync_opt_naming_desc: "روش نام‌گذاری و پیشوند سفارشی.",
+                  sync_opt_update: "بروزرسانی و دسترسی", sync_opt_update_desc: "مخزن گیت‌هاب بروزرسانی و User-Agent عبور از سانسور.",
+                  sync_opt_toggles: "کلیدها و سوییچ‌ها", sync_opt_toggles_desc: "⚠ شامل کلید اضطراری (Kill Switch) است — ممکن است ترافیک سایر پنل‌ها را متوقف کند.",
+                  sync_opt_domain: "دامنه اختصاصی پنل", sync_opt_domain_desc: "⚠ معمولاً هر پنل دامنه خودش را دارد — فقط در صورتی تیک بزنید که عمداً می‌خواهید مشترک باشد.",
+                  sync_opt_identity: "هویت (UUID و مسیر API)", sync_opt_identity_desc: "⚠ مسیر پنهان و UUID دستگاه پنل مقصد را تغییر می‌دهد — لینک‌ها/بوکمارک‌های قدیمی آن از کار می‌افتند.",
+                  sync_opt_users: "کاربران", sync_opt_users_desc: "⚠ کل لیست مشترکین پنل‌های دیگر را با این پنل جایگزین می‌کند — کاربران خودشان حذف می‌شوند.",
+                  sync_opt_security: "امنیت (رمز اصلی)", sync_opt_security_desc: "⚠ رمز عبور ورود را روی سایر پنل‌ها بازنویسی می‌کند.",
+                  sync_opt_cluster: "فهرست نودهای فرعی", sync_opt_cluster_desc: "⚠ لیست نودهای فرعیِ پنل مقصد را بازنویسی می‌کند — امکان ایجاد حلقه همگام‌سازی وجود دارد. مگر عمداً بخواهید، تیک نزنید.",
+                  sync_opt_twofa: "احراز هویت دو مرحله‌ای (2FA)", sync_opt_twofa_desc: "قابل همگام‌سازی نیست: پنل عمداً هرگز رمز 2FA را برای مرورگر ارسال نمی‌کند، پس از اینجا قابل تکرار نیست.",
                   sync_opt_bot: "تنظیمات ربات تلگرام", sync_opt_bot_desc: "⚠ توکن/ادمین ربات را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است ربات آن‌ها دچار اختلال شود.",
                   sync_opt_cf: "تنظیمات API کلادفلر", sync_opt_cf_desc: "⚠ اکانت/توکن/نام Worker را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است دیپلوی یا آمار آن‌ها دچار اختلال شود.",
                   sync_field_tg_token: "توکن ربات", sync_field_tg_chat: "چت آیدی", sync_field_tg_admin: "آیدی مدیر",
@@ -6970,9 +7287,10 @@ function getDashboardUI(hasDB) {
                   acc_b1_title:"پروتکل و پورت‌ها", acc_b2_title:"هویت و امنیت", acc_b3_title:"بروزرسانی و دسترسی", acc_b4_title:"پشتیبان‌گیری و بازیابی",
                   download_worker_btn:"🧩 دانلود سورس ورکر (_worker.js)", download_worker_failed:"دانلود سورس ورکر ناموفق بود: ",
                   download_worker_live_btn:"🌩️ دانلود کد واقعی (فقط کلودفلر)",
-                  view_worker_btn:"👁️ نمایش کد (گیت‌هاب)", view_worker_live_btn:"👁️ نمایش کد واقعی (کلودفلر)",
+                  view_worker_btn:"🧩 سورس ورکر (گیت‌هاب)", view_worker_live_btn:"🌩️ سورس ورکر (کلودفلر)",
+                  backup_grp_config: "پیکربندی", backup_grp_worker: "سورس ورکر", backup_grp_deploy: "استقرار",
                   view_worker_title:"کد سورس ورکر", view_worker_source_lbl:"منبع: ", view_worker_chars:"کاراکتر",
-                  btn_copy:"📋 کپی", btn_close:"بستن", copy_failed:"کپی ناموفق بود.",
+                  btn_copy:"📋 کپی", btn_close:"بستن", btn_download:"⬇️ دانلود", copy_failed:"کپی ناموفق بود.",
                   upload_worker_btn:"⬆️ آپلود / آپدیت ورکر", upload_worker_title:"آپلود / آپدیت ورکر",
                   upload_worker_warning:"⚠️ این کار کد ورکر در حال اجرا رو بازنویسی می‌کنه. مطمئن شو سورس درسته.",
                   upload_worker_url_lbl:"آدرس فایل (مثلاً لینک raw گیت‌هاب به _worker.js)", upload_worker_or:"یا",
@@ -7004,6 +7322,10 @@ function getDashboardUI(hasDB) {
                       view_github: "مشاهده در گیت‌هاب",
                      update_requires_cf: "برای نصب خودکار، شناسه اکانت، توکن API و نام کارگر را تنظیم کنید.",
                      html_desc_strategy: "متغیرهای پشتیبانی شده: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: ایموجی پرچم مربوط به کشور آی‌پی لبه (مثلاً 🇺🇸).<br>• <b>{PROTOCOL}</b>: پروتکل اصلی هسته (VLESS / Trojan).<br>• <b>{USER}</b>: نام یا شناسه مشترک ساب.<br>• <b>{PORT}</b>: پورت فعال اتصال.<br>• <b>{PREFIX}</b>: پیشوند نام دلخواه.<br>• <b>{IP}</b>: آدرس آی‌پی تمیز.</span><br>طرح‌های از پیش تعریف شده: <code>default</code>، <code>type-user-port</code>، <code>user-port</code>، <code>host-port-user</code>، <code>prefix-user-port</code>، <code>ip</code>.",
+                     acc_logs_title: "گزارش فعالیت سیستم", logs_filter_all: "همه انواع", logs_filter_search_ph: "جستجو در جزئیات...", logs_loading: "در حال بارگذاری...",
+                     acc_sessions_title: "ورودهای وب (دستگاه‌های فعال)", sessions_desc: "هر مرورگری که هم‌اکنون وارد این پنل شده، و هر دستگاهی که برای ۲FA به‌خاطر سپرده شده. با پایان دادن به هرکدام، آن دستگاه مجبور به ورود دوباره می‌شود.",
+                     sessions_active_title: "نشست‌های فعال", sessions_trusted_title: "دستگاه‌های مورد اعتماد ۲FA", sessions_none: "نشست فعالی وجود ندارد.", sessions_no_trusted: "دستگاه به‌خاطر سپرده‌شده‌ای وجود ندارد.", btn_end_all_sessions: "خروج از همه نشست‌های دیگر", btn_forget_all_devices: "فراموش کردن همه دستگاه‌ها", grp_limits_title: "محدودیت‌ها و دسترسی", grp_network_title: "شبکه و پروتکل",
+                     btn_end_session: "پایان نشست", btn_forget_device: "فراموش کردن دستگاه",
                 }
           };
 
@@ -7260,9 +7582,16 @@ function getDashboardUI(hasDB) {
               if (savedSession) {
                   try {
                       let parsed = JSON.parse(savedSession);
-                      if (parsed && parsed.expiry && Date.now() < parsed.expiry) {
+                      const sessionStillFresh = parsed && parsed.key && parsed.expiry && Date.now() < parsed.expiry;
+                      const trustStillValid = parsed && parsed.trustToken && parsed.trustExpiry && Date.now() < parsed.trustExpiry;
+                      if (sessionStillFresh) {
                            sessionKey = parsed.key;
                            doLogin(true).then(() => loadDashboard());
+                      } else if (trustStillValid) {
+                          // Auto-resume window passed, but this device is still remembered
+                          // for 2FA purposes (up to 30 days) -- keep the trust token around
+                          // so the login screen's fresh password submit skips the 2FA step.
+                          localStorage.setItem('nahan_session', JSON.stringify({ key: '', expiry: 0, trustToken: parsed.trustToken, trustExpiry: parsed.trustExpiry }));
                       } else {
                           localStorage.removeItem('nahan_session');
                       }
@@ -7381,6 +7710,7 @@ function getDashboardUI(hasDB) {
             if(tab === 'network') doLogin(true); // refresh metrics
         }
 
+        let allLogsCache = [];
         async function loadLogs() {
             const container = document.getElementById('logs-container');
             if(!container) return;
@@ -7389,22 +7719,216 @@ function getDashboardUI(hasDB) {
                 const res = await fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) });
                 const data = await res.json();
                 if (data.success && data.logs) {
-                    container.innerHTML = '';
-                    if (data.logs.length === 0) {
-                        container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">No activity logs found.</p>';
-                        return;
+                    allLogsCache = data.logs;
+                    const typeSelect = document.getElementById('logs-filter-type');
+                    if (typeSelect) {
+                        const prevVal = typeSelect.value;
+                        const types = Array.from(new Set(allLogsCache.map(l => l.type))).sort();
+                        typeSelect.innerHTML = '<option value="" data-i18n="logs_filter_all">' + (i18n[lang]?.logs_filter_all || 'All types') + '</option>' +
+                            types.map(t => '<option value="' + t.replace(/"/g, '&quot;') + '">' + t + '</option>').join('');
+                        typeSelect.value = types.includes(prevVal) ? prevVal : '';
                     }
-                    data.logs.forEach(log => {
-                        const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
-                        const html = \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
-                        container.insertAdjacentHTML('beforeend', html);
-                    });
+                    renderFilteredLogs();
                 } else {
                     container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Failed to load logs.</p>';
                 }
             } catch (err) {
                 container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Error loading logs.</p>';
             }
+        }
+
+        function renderFilteredLogs() {
+            const container = document.getElementById('logs-container');
+            if (!container) return;
+            const typeFilter = document.getElementById('logs-filter-type')?.value || '';
+            const searchFilter = (document.getElementById('logs-filter-search')?.value || '').trim().toLowerCase();
+            const filtered = allLogsCache.filter(log => {
+                if (typeFilter && log.type !== typeFilter) return false;
+                if (searchFilter && !((log.detail || '') + ' ' + (log.type || '')).toLowerCase().includes(searchFilter)) return false;
+                return true;
+            });
+            container.innerHTML = '';
+            if (filtered.length === 0) {
+                container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4" data-i18n="logs_none">No activity logs found.</p>';
+                applyLang();
+                return;
+            }
+            filtered.forEach(log => {
+                const dateStr = safeDateTimeString(log.ts);
+                const html = \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
+                container.insertAdjacentHTML('beforeend', html);
+            });
+        }
+
+        function safeDateTimeString(ts) {
+            try {
+                const d = new Date(ts);
+                if (isNaN(d.getTime())) return '—';
+                return d.toLocaleString(lang === 'fa' ? 'fa-IR' : 'en-US', { hour12: false });
+            } catch (e) {
+                console.error('[safeDateTimeString] failed:', e);
+                return '—';
+            }
+        }
+
+        function safeDateString(ts) {
+            try {
+                const d = new Date(ts);
+                if (isNaN(d.getTime())) return '—';
+                const pad = n => String(n).padStart(2, '0');
+                if (lang === 'fa') {
+                    try {
+                        const parts = new Intl.DateTimeFormat('fa-IR-u-ca-persian-nu-latn', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+                        const get = t => parts.find(p => p.type === t)?.value || '';
+                        const y = get('year').padStart(4, '0');
+                        const mo = get('month').padStart(2, '0');
+                        const da = get('day').padStart(2, '0');
+                        const hh = get('hour').padStart(2, '0');
+                        const mi = get('minute').padStart(2, '0');
+                        if (y && mo && da) return y + '-' + mo + '-' + da + ' ' + hh + ':' + mi;
+                    } catch (jalaliErr) {
+                        console.error('[safeDateString] Jalali conversion failed, falling back to Gregorian:', jalaliErr);
+                    }
+                }
+                return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+            } catch (e) {
+                console.error('[safeDateString] failed:', e);
+                return '—';
+            }
+        }
+
+        function formatDeviceLabel(ua) {
+            if (!ua) return (lang === 'fa') ? 'دستگاه نامشخص' : 'Unknown device';
+            const isMobile = /Mobile|Android|iPhone/i.test(ua);
+            let browser = 'Browser';
+            if (/Edg\\//i.test(ua)) browser = 'Edge';
+            else if (/Chrome\\//i.test(ua)) browser = 'Chrome';
+            else if (/Firefox\\//i.test(ua)) browser = 'Firefox';
+            else if (/Safari\\//i.test(ua)) browser = 'Safari';
+            let os = '';
+            if (/Windows/i.test(ua)) os = 'Windows';
+            else if (/Android/i.test(ua)) os = 'Android';
+            else if (/iPhone|iPad|iOS/i.test(ua)) os = 'iOS';
+            else if (/Mac OS/i.test(ua)) os = 'macOS';
+            else if (/Linux/i.test(ua)) os = 'Linux';
+            return \`\${isMobile ? '📱' : '🖥️'} \${browser}\${os ? ' · ' + os : ''}\`;
+        }
+
+        async function loadSessions() {
+            const sessCont = document.getElementById('sessions-container');
+            const devCont = document.getElementById('trusted-devices-container');
+            if (!sessCont) return;
+            sessCont.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">Loading...</p>';
+            devCont.innerHTML = '';
+            try {
+                const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'list_sessions' }) });
+                let data;
+                try {
+                    data = await res.json();
+                } catch (parseErr) {
+                    const raw = await res.text().catch(() => '');
+                    console.error('[loadSessions] Non-JSON response, HTTP', res.status, raw.slice(0, 300));
+                    sessCont.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Server error (HTTP ' + res.status + '). Check console/network tab.</p>';
+                    return;
+                }
+                if (!data.success) {
+                    console.error('[loadSessions] Server returned failure:', data);
+                    sessCont.innerHTML = '<p class="text-sm text-red-400 text-center py-4">' + (data.error ? data.error : 'Failed to load sessions.') + '</p>';
+                    return;
+                }
+
+                sessCont.innerHTML = '';
+                const otherSessionsCount = data.sessions.filter(s => !s.current).length;
+                const revokeAllSessBtn = document.getElementById('btn-revoke-all-sessions');
+                if (revokeAllSessBtn) revokeAllSessBtn.classList.toggle('hidden', otherSessionsCount === 0);
+                if (data.sessions.length === 0) {
+                    sessCont.innerHTML = '<p class="text-sm text-slate-400 text-center py-4" data-i18n="sessions_none">No active sessions.</p>';
+                } else {
+                    data.sessions.forEach(s => {
+                        try {
+                            const dateStr = s.createdAt ? safeDateString(s.createdAt) : '—';
+                            const currentBadge = s.current ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-300">\${lang === 'fa' ? 'همین دستگاه' : 'This device'}</span>\` : '';
+                            const revokeBtn = s.current ? '' : \`<button onclick="revokeSession('\${s.id}')" class="text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-500 border border-rose-500/30 hover:bg-rose-500/20 shrink-0" data-i18n="btn_end_session">End session</button>\`;
+                            sessCont.insertAdjacentHTML('beforeend', \`<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                <div>
+                                    <p class="text-sm font-bold text-slate-700 dark:text-slate-200 flex items-center gap-2">\${formatDeviceLabel(s.ua)} \${currentBadge}</p>
+                                    <p class="text-[11px] text-slate-400 font-mono">\${s.ip} · \${dateStr}</p>
+                                </div>
+                                \${revokeBtn}
+                            </div>\`);
+                        } catch (rowErr) {
+                            console.error('[loadSessions] Failed to render a session row, skipping it:', rowErr, s);
+                        }
+                    });
+                    if (sessCont.innerHTML === '') sessCont.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Could not render session list (see console).</p>';
+                }
+
+                const revokeAllDevBtn = document.getElementById('btn-revoke-all-devices');
+                if (revokeAllDevBtn) revokeAllDevBtn.classList.toggle('hidden', data.devices.length === 0);
+                if (data.devices.length === 0) {
+                    devCont.innerHTML = '<p class="text-sm text-slate-400 text-center py-4" data-i18n="sessions_no_trusted">No remembered devices.</p>';
+                } else {
+                    data.devices.forEach(d => {
+                        try {
+                            const dateStr = d.createdAt ? safeDateString(d.createdAt) : '—';
+                            devCont.insertAdjacentHTML('beforeend', \`<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                <div>
+                                    <p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${formatDeviceLabel(d.ua)}</p>
+                                    <p class="text-[11px] text-slate-400 font-mono">\${d.ip} · \${dateStr}</p>
+                                </div>
+                                <button onclick="revokeDevice('\${d.id}')" class="text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-500 border border-rose-500/30 hover:bg-rose-500/20 shrink-0" data-i18n="btn_forget_device">Forget device</button>
+                            </div>\`);
+                        } catch (rowErr) {
+                            console.error('[loadSessions] Failed to render a trusted-device row, skipping it:', rowErr, d);
+                        }
+                    });
+                    if (devCont.innerHTML === '') devCont.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Could not render device list (see console).</p>';
+                }
+                applyLang();
+            } catch (e) {
+                console.error('[loadSessions] Unexpected error:', e);
+                sessCont.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Error loading sessions: ' + (e && e.message ? e.message : e) + '</p>';
+            }
+        }
+
+        async function revokeSession(id) {
+            const msg = lang === 'fa' ? 'این نشست وارد شده در دستگاه دیگر پایان می‌یابد. ادامه می‌دهید؟' : 'This will log that device out. Continue?';
+            if (!confirm(msg)) return;
+            try {
+                const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'revoke_session', id }) });
+                const data = await res.json();
+                if (!data.success && data.error) alert(data.error);
+            } catch (e) { /* loadSessions() below will show the generic error state */ }
+            loadSessions();
+        }
+
+        async function revokeDevice(id) {
+            const msg = lang === 'fa' ? 'دفعه بعد که از این دستگاه لاگین شود، دوباره کد ۲مرحله‌ای خواسته می‌شود. ادامه می‌دهید؟' : 'Next login from that device will require a 2FA code again. Continue?';
+            if (!confirm(msg)) return;
+            await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'revoke_device', id }) });
+            loadSessions();
+        }
+
+        async function revokeAllSessions() {
+            const msg = lang === 'fa' ? 'همه‌ی نشست‌های وارد شده در دستگاه‌های دیگر پایان می‌یابد (این دستگاه از این کار مستثنی است). ادامه می‌دهید؟' : 'This will log out every other device currently signed in (this device stays logged in). Continue?';
+            if (!confirm(msg)) return;
+            try {
+                const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'revoke_all_sessions' }) });
+                const data = await res.json();
+                if (!data.success && data.error) alert(data.error);
+            } catch (e) { /* loadSessions() below will show the generic error state */ }
+            loadSessions();
+        }
+
+        async function revokeAllDevices() {
+            const msg = lang === 'fa' ? 'همه‌ی دستگاه‌های به‌خاطر سپرده‌شده برای ۲مرحله‌ای حذف می‌شوند و دفعه‌ی بعد ورود، همه دوباره کد لازم خواهند داشت. ادامه می‌دهید؟' : 'All remembered 2FA devices will be forgotten; every one of them will need a code again next time. Continue?';
+            if (!confirm(msg)) return;
+            try {
+                const res = await fetch(baseRoute + '/api/2fa', { method: 'POST', body: JSON.stringify({ key: sessionKey, action: 'revoke_all_devices' }) });
+                const data = await res.json();
+                if (!data.success && data.error) alert(data.error);
+            } catch (e) { /* loadSessions() below will show the generic error state */ }
+            loadSessions();
         }
 
         async function loadDashboard() {
@@ -7556,7 +8080,7 @@ if (users.length > 0) {
                 if (logsData.success && logsData.logs && logsData.logs.length > 0) {
                     actList.innerHTML = '';
                     logsData.logs.slice(0, 8).forEach(log => {
-                        const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
+                        const dateStr = safeDateTimeString(log.ts);
                         const typeColors = { 'Auth Success': 'bg-emerald-500', 'Auth Failed': 'bg-red-500', 'User Created': 'bg-blue-500', 'User Deleted': 'bg-red-500', 'User Toggled': 'bg-amber-500', 'User Updated': 'bg-indigo-500', 'User Auto-Disabled': 'bg-red-500', 'Traffic Reset': 'bg-cyan-500', 'Config Changed': 'bg-violet-500' };
                         const dotColor = typeColors[log.type] || 'bg-slate-400';
                         actList.insertAdjacentHTML('beforeend', '<div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl"><div class="w-2 h-2 rounded-full shrink-0 ' + dotColor + '"></div><div class="flex-1 min-w-0"><p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">' + log.type + '</p><p class="text-[11px] text-slate-400 truncate">' + log.detail + '</p></div><span class="text-[10px] font-mono text-slate-400 shrink-0">' + dateStr + '</span></div>');
@@ -7738,7 +8262,16 @@ if (users.length > 0) {
           }
   
           function logout() {
-              localStorage.removeItem('nahan_session');
+              // Logging out shouldn't undo "remember this device" -- only drop the
+              // short-lived session key so the next login still skips the 2FA step.
+              try {
+                  const parsed = JSON.parse(localStorage.getItem('nahan_session') || 'null');
+                  if (parsed && parsed.trustToken && parsed.trustExpiry && Date.now() < parsed.trustExpiry) {
+                      localStorage.setItem('nahan_session', JSON.stringify({ key: '', expiry: 0, trustToken: parsed.trustToken, trustExpiry: parsed.trustExpiry }));
+                  } else {
+                      localStorage.removeItem('nahan_session');
+                  }
+              } catch(e) { localStorage.removeItem('nahan_session'); }
               window.location.reload();
           }
   
@@ -7796,6 +8329,7 @@ if (users.length > 0) {
           }
 
           let _viewedWorkerCode = '';
+          let _viewedWorkerIsLive = false;
           async function viewWorkerSource(liveOnly) {
               const btn = document.getElementById(liveOnly ? 'btn-view-worker-live' : 'btn-view-worker');
               const originalHtml = btn.innerHTML;
@@ -7812,6 +8346,7 @@ if (users.length > 0) {
                   const codeText = await res.text();
                   const sourceLabel = res.headers.get('X-Worker-Source') || (liveOnly ? 'cloudflare' : 'auto');
                   _viewedWorkerCode = codeText;
+                  _viewedWorkerIsLive = !!liveOnly;
                   document.getElementById('view-worker-code').textContent = codeText;
                   document.getElementById('view-worker-subtitle').textContent =
                       (i18n[lang]?.view_worker_source_lbl || 'Source: ') + sourceLabel + ' — ' + codeText.length + ' ' + (i18n[lang]?.view_worker_chars || 'characters');
@@ -7836,33 +8371,20 @@ if (users.length > 0) {
               });
           }
 
-          async function downloadWorkerSource(liveOnly) {
-              const btn = document.getElementById(liveOnly ? 'btn-download-worker-live' : 'btn-download-worker');
-              const originalHtml = btn.innerHTML;
-              btn.disabled = true;
-              btn.innerHTML = '⏳ ...';
+          function downloadViewedWorkerSource() {
+              if (!_viewedWorkerCode) return;
               try {
-                  const res = await fetch(baseRoute + '/api/download-worker' + (liveOnly ? '?source=live' : ''), {
-                      headers: { 'Authorization': 'Bearer ' + sessionKey }
-                  });
-                  if (!res.ok) {
-                      const errJson = await res.json().catch(() => ({}));
-                      throw new Error(errJson.error || ('HTTP ' + res.status));
-                  }
-                  const blob = await res.blob();
+                  const blob = new Blob([_viewedWorkerCode], { type: 'application/javascript' });
                   const dlUrl = URL.createObjectURL(blob);
                   const a = document.createElement('a');
                   a.href = dlUrl;
-                  a.download = '_worker.js';
+                  a.download = _viewedWorkerIsLive ? '_worker.live.js' : '_worker.js';
                   document.body.appendChild(a);
                   a.click();
                   a.remove();
                   URL.revokeObjectURL(dlUrl);
               } catch (e) {
                   alert((i18n[lang]?.download_worker_failed || 'Failed to download worker source: ') + e.message);
-              } finally {
-                  btn.disabled = false;
-                  btn.innerHTML = originalHtml;
               }
           }
 
@@ -8057,7 +8579,17 @@ if (users.length > 0) {
                       // back a short-lived, revocable session token and that's the only
                       // thing we persist or reuse for future requests.
                       sessionKey = data.sessionToken || pass; localUUID = data.deviceId;
-                      localStorage.setItem('nahan_session', JSON.stringify({ key: sessionKey, trustToken: data.trustToken || (cachedSession && cachedSession.trustToken) || null, expiry: Date.now() + 30 * 60 * 1000 }));
+                      // The short "expiry" below only controls how long we'll silently
+                      // auto-resume the dashboard without re-prompting for the password.
+                      // The "remember this device" trust token is a completely separate,
+                      // much longer-lived thing (up to 30 days server-side) and must NOT
+                      // be thrown away just because that short window passed -- that
+                      // mismatch was why 2FA kept reappearing even with "remember" checked.
+                      const newTrustToken = data.trustToken || (cachedSession && cachedSession.trustToken) || null;
+                      const trustExpiry = data.trustToken
+                          ? (Date.now() + 30 * 24 * 60 * 60 * 1000)
+                          : ((cachedSession && cachedSession.trustExpiry) || null);
+                      localStorage.setItem('nahan_session', JSON.stringify({ key: sessionKey, expiry: Date.now() + 30 * 60 * 1000, trustToken: newTrustToken, trustExpiry: newTrustToken ? trustExpiry : null }));
                       if (data.usedRecoveryCode && !silent) {
                           setTimeout(() => alert((typeof lang !== 'undefined' && lang === 'fa')
                               ? ('شما با یک کد بازیابی وارد شدید. ' + data.recoveryRemaining + ' کد دیگر باقی مانده است. برای امنیت بیشتر، از بخش تنظیمات کدهای بازیابی جدید بسازید.')
@@ -8209,7 +8741,16 @@ if (users.length > 0) {
                       updateUI();
                   } else { 
                       if(!silent) { document.getElementById('err-msg').classList.remove('hidden'); btn.innerText = origText; }
-                      else { localStorage.removeItem('nahan_session'); }
+                      else {
+                          try {
+                              const parsed = JSON.parse(localStorage.getItem('nahan_session') || 'null');
+                              if (parsed && parsed.trustToken && parsed.trustExpiry && Date.now() < parsed.trustExpiry) {
+                                  localStorage.setItem('nahan_session', JSON.stringify({ key: '', expiry: 0, trustToken: parsed.trustToken, trustExpiry: parsed.trustExpiry }));
+                              } else {
+                                  localStorage.removeItem('nahan_session');
+                              }
+                          } catch(e) { localStorage.removeItem('nahan_session'); }
+                      }
                   }
               } catch (err) { if(!silent) btn.innerText = origText; }
           }
@@ -8265,6 +8806,12 @@ if (users.length > 0) {
               parent.checked = allChecked;
               parent.indeterminate = !allChecked && !noneChecked;
           }
+          function syncSelectAll(checked) {
+              document.querySelectorAll('#modal-sync-nodes input[type="checkbox"]:not(:disabled)').forEach(cb => {
+                  cb.checked = checked;
+                  cb.indeterminate = false;
+              });
+          }
 
           function openSyncModal() {
               const nodesRaw = document.getElementById('cfg-nodes').value;
@@ -8286,27 +8833,30 @@ if (users.length > 0) {
               icon.classList.add('animate-spin');
 
               const el = id => document.getElementById(id);
-              const includeGeneral = el('sync-opt-general').checked;
 
-              // فقط فیلدهای تیک‌خورده به payload اضافه می‌شن؛ چون گیرنده روی
-              // sysConfig موجودش spread می‌کنه، فیلدهایی که ارسال نمی‌شن دست‌نخورده
-              // باقی می‌مونن و پنل‌های دیگه دچار اختلال نمی‌شن.
+              // هر گروه فقط وقتی تیک خورده باشه فیلدهاش به payload اضافه می‌شه. سمت
+              // سرور دیگه دیگه کل sysConfig رو به نودها ریلی نمی‌کنه — فقط همین
+              // "config" جزئی که اینجا می‌سازیم ارسال می‌شه، پس هرچی این‌جا تیک
+              // نخوره، دست‌نخورده روی پنل مقصد باقی می‌مونه.
               let config = {};
 
-              if (includeGeneral) {
-                  Object.assign(config, {
-                      mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
-                      apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
-                      enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
-                      githubRepo: el('cfg-github-repo').value,
-                      subUserAgent: el('cfg-sub-ua').value,
-                      customPanelUrl: el('cfg-custom-panel-url').value,
-                      nameStrategy: el('cfg-name-strategy').value,
-                      namePrefix: el('cfg-name-prefix').value
-                  });
-              }
+              const groupBuilders = {
+                  ports: () => ({ mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o => o.value).join(',') }),
+                  network: () => ({ agent: el('cfg-fp').value, resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value }),
+                  cleanips: () => ({ cleanIps: el('cfg-ips').value }),
+                  naming: () => ({ nameStrategy: el('cfg-name-strategy').value, namePrefix: el('cfg-name-prefix').value }),
+                  update: () => ({ githubRepo: el('cfg-github-repo').value, subUserAgent: el('cfg-sub-ua').value }),
+                  toggles: () => ({ enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked, silentAlerts: el('cfg-silent').checked, isPaused: el('cfg-pause').checked }),
+                  domain: () => ({ customPanelUrl: el('cfg-custom-panel-url').value }),
+                  identity: () => ({ deviceId: el('cfg-uuid').value, apiRoute: el('cfg-path').value }),
+                  users: () => ({ users: (window.nahanConfig && window.nahanConfig.users) ? window.nahanConfig.users : [] }),
+                  security: () => ({ masterKey: el('cfg-pass').value }),
+                  cluster: () => ({ slaveNodes: el('cfg-nodes').value })
+              };
+              Object.keys(groupBuilders).forEach(group => {
+                  const cb = el('sync-opt-' + group);
+                  if (cb && cb.checked) Object.assign(config, groupBuilders[group]());
+              });
 
               // هر زیرفیلد ربات/کلادفلر مستقل از بقیه انتخاب می‌شه (مثلاً فقط آیدی مدیر
               // بدون توکن ربات) — نگاشت هر data-field به عنصر فرم منبعش:
@@ -8321,6 +8871,13 @@ if (users.length > 0) {
                       if (srcId) config[field] = el(srcId).value;
                   }
               });
+
+              if (Object.keys(config).length === 0) {
+                  btnTxt.innerText = lang === 'fa' ? 'چیزی انتخاب نشده' : 'Nothing selected';
+                  icon.classList.remove('animate-spin');
+                  setTimeout(() => { btnTxt.innerText = 'Force Sync Now'; }, 2500);
+                  return;
+              }
 
               const payload = { key: sessionKey, config };
 
@@ -9461,15 +10018,9 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
           //DateTime Function
             function updatePersianDateTime() {
     const now = new Date();
-
-    const formatter = new Intl.DateTimeFormat('fa-IR', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    });
+    const formatter = (lang === 'fa')
+        ? new Intl.DateTimeFormat('fa-IR', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+        : new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
     const parts = formatter.formatToParts(now);
 
@@ -9477,15 +10028,13 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
     parts.forEach(p => {
         map[p.type] = p.value;
     });
-    
-    
-   
-  
-      
-        const custom = \`\${map.day} \${map.month} \${map.year} \${map.hour}:\${map.minute}:\${map.second}\`;
+
+    const custom = (lang === 'fa')
+        ? \`\${map.day} \${map.month} \${map.year} \${map.hour}:\${map.minute}:\${map.second}\`
+        : \`\${map.month} \${map.day}, \${map.year} \${map.hour}:\${map.minute}:\${map.second}\`;
 
     document.getElementById("net-datetime").innerText = custom;
-    
+
 }
 
                 updatePersianDateTime();
