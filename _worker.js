@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.8.6";
+const CURRENT_VERSION = "3.0.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -107,6 +107,70 @@ async function sha256Hex(text) {
     return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// --- Master key hashing (PBKDF2-SHA256) + cluster sync secret ---------------
+// The panel's own login password is never stored in plaintext: only a salted
+// PBKDF2 hash is kept. Machine-to-machine auth (linked/slave panels) uses a
+// completely separate, random `syncSecret` instead of the login password, so
+// hashing the password doesn't break clustering.
+function bytesToHex(bytes) { return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(""); }
+function hexToBytes(hex) {
+    const clean = String(hex || "");
+    const out = new Uint8Array(Math.floor(clean.length / 2));
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+    return out;
+}
+
+function timingSafeEqual(a, b) {
+    const strA = String(a ?? ""), strB = String(b ?? "");
+    if (strA.length !== strB.length) return false;
+    let diff = 0;
+    for (let i = 0; i < strA.length; i++) diff |= strA.charCodeAt(i) ^ strB.charCodeAt(i);
+    return diff === 0;
+}
+
+const MASTER_KEY_PBKDF2_ITERATIONS = 100000;
+
+async function hashMasterKey(password, saltHex = null) {
+    const salt = saltHex ? hexToBytes(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+    const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), { name: "PBKDF2" }, false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: MASTER_KEY_PBKDF2_ITERATIONS, hash: "SHA-256" }, keyMaterial, 256);
+    return { hash: bytesToHex(new Uint8Array(bits)), salt: bytesToHex(salt) };
+}
+
+async function verifyMasterKey(providedPassword) {
+    if (!providedPassword || !sysConfig.masterKeyHash || !sysConfig.masterKeySalt) return false;
+    const { hash } = await hashMasterKey(providedPassword, sysConfig.masterKeySalt);
+    return timingSafeEqual(hash, sysConfig.masterKeyHash);
+}
+
+// Runs once per isolate (cheap no-op after that, since the condition below
+// becomes false): converts old installs that still have a plaintext
+// `masterKey` into a hash + a fresh cluster sync secret, and drops the
+// plaintext field from storage for good.
+async function ensureAuthMigrated(env, ctx) {
+    let changed = false;
+    if (!sysConfig.masterKeyHash || !sysConfig.masterKeySalt) {
+        const plain = sysConfig.masterKey || "admin";
+        const { hash, salt } = await hashMasterKey(plain);
+        sysConfig = { ...sysConfig, masterKeyHash: hash, masterKeySalt: salt };
+        changed = true;
+    }
+    if (!sysConfig.syncSecret) {
+        sysConfig = { ...sysConfig, syncSecret: base32Encode(crypto.getRandomValues(new Uint8Array(20))) };
+        changed = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(sysConfig, "masterKey")) {
+        const { masterKey, ...rest } = sysConfig;
+        sysConfig = rest;
+        changed = true;
+    }
+    if (changed && env) {
+        const write = cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {});
+        if (ctx) ctx.waitUntil(write); else await write;
+    }
+}
+// --- end master key hashing / sync secret ------------------------------------
+
 function generateRecoveryCodes(count = 10) {
     const codes = [];
     for (let i = 0; i < count; i++) {
@@ -126,6 +190,26 @@ function generateRecoveryCodes(count = 10) {
 // the browser to hold the real password after the initial login.
 const SESSION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24h sliding window
 
+// Removes expired session tokens / trusted devices from sysConfig and persists
+// the change if anything was actually dropped. Called opportunistically from
+// isKeyAuthorized (i.e. on effectively every authenticated dashboard request)
+// so stale entries get deleted from D1 promptly, not just "ignored forever".
+// The scheduled() cron handler below also calls this for panels that go idle
+// with nobody logging in to trigger it naturally.
+async function pruneAuthArtifacts(env, ctx) {
+    const now = Date.now();
+    const tokens = sysConfig.sessionTokens || [];
+    const devices = sysConfig.trustedDevices || [];
+    const freshTokens = tokens.filter(t => t.expiry > now);
+    const freshDevices = devices.filter(d => d.expiry > now);
+    if (freshTokens.length === tokens.length && freshDevices.length === devices.length) return;
+    sysConfig = { ...sysConfig, sessionTokens: freshTokens, trustedDevices: freshDevices };
+    if (env) {
+        const write = cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {});
+        if (ctx) ctx.waitUntil(write); else await write;
+    }
+}
+
 async function mintSessionToken(env, ctx, request) {
     const token = base32Encode(crypto.getRandomValues(new Uint8Array(24)));
     const hash = await sha256Hex(token);
@@ -140,7 +224,12 @@ async function mintSessionToken(env, ctx, request) {
 
 async function isKeyAuthorized(providedKey, env, ctx) {
     if (!providedKey) return false;
-    if (providedKey === sysConfig.masterKey) return true;
+    await ensureAuthMigrated(env, ctx);
+    // Machine credential used by linked/slave panels — never a human login, no 2FA involved.
+    if (sysConfig.syncSecret && timingSafeEqual(providedKey, sysConfig.syncSecret)) return true;
+    // The real login password, checked against its hash (covers direct API/script
+    // use with the actual password, e.g. curl/PowerShell automation).
+    if (await verifyMasterKey(providedKey)) return true;
     const hash = await sha256Hex(providedKey);
     const tokens = sysConfig.sessionTokens || [];
     const match = tokens.find(t => t.hash === hash && t.expiry > Date.now());
@@ -155,6 +244,11 @@ async function isKeyAuthorized(providedKey, env, ctx) {
     if (match.expiry < halfLife) {
         match.expiry = Date.now() + SESSION_TOKEN_TTL_MS;
         if (env) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+    } else {
+        // Not renewing this time, but still a good, cheap moment to sweep out
+        // anything else (other sessions, remembered devices) that expired since
+        // the last check.
+        if (env) ctx?.waitUntil(pruneAuthArtifacts(env, ctx));
     }
     return true;
 }
@@ -166,10 +260,11 @@ const SYSTEM_DEFAULTS = {
     maintenanceHost: "https://www.ubuntu.com, https://www.docker.com",
     backupRelay: "",
     customRelay: "",
-    masterKey: "admin",
+    masterKeyHash: "",
+    masterKeySalt: "",
+    syncSecret: "",
     metricNode: "time.is",
     cleanIps: "",
-    slaveNodes: "",
     deviceId: "",
     mode: "alpha",
     agent: "chrome",
@@ -199,7 +294,6 @@ const SYSTEM_DEFAULTS = {
     expiryMs: 0,
     linkedPanels: [],
     hubPanelUrl: "",
-    allowSyncWorker: false,
     add_panel: "Add Panel",
     timezone: "Asia/Tehran",
     // --- 2FA state ---
@@ -732,6 +826,18 @@ export default {
         } catch (err) {
             return new Response(null, { status: 404 });
         }
+    },
+
+    // Only runs if a Cron Trigger is configured for this Worker (Cloudflare dashboard →
+    // Workers → your worker → Settings → Trigger Events → Cron Trigger, e.g. daily).
+    // Without one, expired sessions/trusted devices still get swept out automatically the
+    // next time anyone makes an authenticated request (see isKeyAuthorized) — this handler
+    // just also cleans them up on a schedule for panels nobody logs into for a while.
+    async scheduled(event, env, ctx) {
+        try {
+            await loadSysConfig(env);
+            await pruneAuthArtifacts(env, ctx);
+        } catch (e) {}
     },
 };
 
@@ -1600,6 +1706,24 @@ async function handleUploadWorker(request, env, ctx) {
         }
 
         const result = await performWorkerUpload(env, ctx, code);
+
+        // Optionally push this same code out to every linked panel too, so a single
+        // "update panel" action can keep the whole cluster on the same version.
+        // Only attempted after the LOCAL deploy succeeded, and only when the caller
+        // (the panel's own dashboard) explicitly asked for it via syncLinked.
+        if (result.success && body.syncLinked && Array.isArray(sysConfig.linkedPanels) && sysConfig.linkedPanels.length > 0) {
+            const linkedResults = await Promise.all(sysConfig.linkedPanels.map(async (panel) => {
+                try {
+                    const res = await fetchRemotePanelUploadWorker(panel, code);
+                    return { host: panel.host, success: !!(res && res.success), error: (res && res.error) || null };
+                } catch (e) {
+                    return { host: panel.host, success: false, error: e.message };
+                }
+            }));
+            result.linkedResults = linkedResults;
+            ctx?.waitUntil(logActivity(env, "Cluster Worker Uploaded", `Relayed manual worker update to ${linkedResults.filter(r => r.success).length}/${linkedResults.length} linked panels`).catch(() => {}));
+        }
+
         return new Response(JSON.stringify(result), { status: result.success ? 200 : 400, headers: { "Content-Type": "application/json" } });
     } catch (e) {
         return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
@@ -1824,7 +1948,8 @@ async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
         const ip = request.headers.get("cf-connecting-ip") || "Unknown";
-        const isRawPassword = data.key === sysConfig.masterKey;
+        await ensureAuthMigrated(env, ctx);
+        const isRawPassword = await verifyMasterKey(data.key);
         const isTokenAuth = !isRawPassword && await isKeyAuthorized(data.key, env, ctx);
 
         if (isRawPassword || isTokenAuth) {
@@ -1854,7 +1979,6 @@ async function handleAuth(request, hostName, ctx, env) {
                         name: sysConfig.name || hostName,
                         host: hostName,
                         apiRoute: sysConfig.apiRoute,
-                        masterKey: sysConfig.masterKey,
                         isLocal: true,
                         ts: Date.now()
                     };
@@ -1871,7 +1995,7 @@ async function handleAuth(request, hostName, ctx, env) {
                             panelName: sysConfig.name || hostName,
                             panelHost: hostName,
                             panelApiRoute: sysConfig.apiRoute,
-                            panelMasterKey: sysConfig.masterKey,
+                            panelMasterKey: sysConfig.syncSecret,
                             tgAdminId: sysConfig.tgAdminId,
                             ts: Date.now()
                         };
@@ -1934,6 +2058,8 @@ async function handleAuth(request, hostName, ctx, env) {
             delete safeConfig.recoveryCodeHashes;
             delete safeConfig.trustedDevices;
             delete safeConfig.sessionTokens;
+            delete safeConfig.masterKeyHash;
+            delete safeConfig.masterKeySalt;
             return new Response(JSON.stringify({
                 success: true, config: safeConfig, deviceId: activeDeviceId, network: netInfo, usage: usageData, sysUsage: (sysUsageCache && sysUsageCache.users) ? sysUsageCache.users : {},
                 version: CURRENT_VERSION,
@@ -2123,26 +2249,46 @@ async function handleTwoFactorApi(request, env, ctx, hostName) {
 async function handleConfigSync(request, env, ctx) {
     try {
         const data = await request.json();
-        const isAuthorized = (await isKeyAuthorized(data.key, env, ctx)) ||
-            (data.oldKey && data.oldKey === sysConfig.masterKey);
+        await ensureAuthMigrated(env, ctx);
+        const isAuthorized = await isKeyAuthorized(data.key, env, ctx);
         if (!isAuthorized) return new Response(JSON.stringify({ success: false }), { status: 401 });
-        if (data.fromMaster && !sysConfig.allowSyncWorker) {
-            return new Response(JSON.stringify({ success: false, error: "Sync not allowed" }), { status: 403 });
-        }
         if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
 
         let nextConfig = sysConfig;
         if (data.config) {
             nextConfig = { ...sysConfig, ...data.config };
-            // If the master key is being changed, force everyone (including this
-            // browser) to log in again with the new password + 2FA — old session
-            // tokens and "remembered" 2FA devices are no longer trustworthy.
-            if (data.config.masterKey && data.config.masterKey !== sysConfig.masterKey) {
+            let credentialChanged = false;
+
+            // The browser sends a plaintext new password when the admin changes it in
+            // Settings. It's hashed right here and the plaintext is never written to D1.
+            if (typeof data.config.masterKey === "string" && data.config.masterKey.length > 0) {
+                const { hash, salt } = await hashMasterKey(data.config.masterKey);
+                nextConfig.masterKeyHash = hash;
+                nextConfig.masterKeySalt = salt;
+                credentialChanged = true;
+            } else if (data.config.masterKeyHash && data.config.masterKeySalt) {
+                // Replicated hash+salt from another panel in the cluster (Force Sync's
+                // "Security" category) — never the plaintext, just the verifier pair.
+                credentialChanged = true;
+            }
+            delete nextConfig.masterKey; // never persisted in plaintext, regardless of source
+
+            if (credentialChanged) {
+                // Old session tokens and "remembered" 2FA devices are no longer
+                // trustworthy once the login credential actually changes.
                 nextConfig.sessionTokens = [];
                 nextConfig.trustedDevices = [];
             }
             sysConfig = nextConfig;
             await cachedD1Put(env, "sys_config", JSON.stringify(nextConfig));
+
+            if (data.fromMaster) {
+                // این درخواست از یه پنل دیگه (لینک‌شده در خوشه) اومده، نه یه ذخیره‌ی
+                // معمولی ادمین از همین پنل — پس مثل لاگین‌ها، یه لاگ قابل‌مشاهده ثبت می‌کنیم.
+                const ip = request.headers.get("cf-connecting-ip") || "unknown";
+                const fields = Object.keys(data.config).join(", ");
+                ctx?.waitUntil(logActivity(env, "Config Synced", `Received settings from another panel (${ip}): ${fields}`).catch(() => {}));
+            }
         }
 
         if (data.resetUUID) {
@@ -2156,25 +2302,6 @@ async function handleConfigSync(request, env, ctx) {
                 sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
             await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
-        }
-
-        const oldMasterKey = sysConfig.masterKey;
-        if (data.config && !data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
-            let nodes = nextConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean);
-            let currentHost = new URL(request.url).hostname;
-            nodes.forEach(node => {
-                if(node !== currentHost) {
-                    // Only relay the fields actually submitted in THIS request (data.config),
-                    // not the full merged nextConfig — otherwise every save (including a
-                    // deliberately narrow Force Sync selection) would silently push the
-                    // entire local config (master key, users, everything) to every slave.
-                    ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ key: nextConfig.masterKey, oldKey: oldMasterKey, config: data.config, fromMaster: true })
-                    }).catch(() => {}));
-                }
-            });
         }
 
         if (nextConfig.tgToken && ctx) {
@@ -2194,7 +2321,28 @@ async function handleConfigSync(request, env, ctx) {
             }).catch(()=>{}));
         }
 
-        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute }), { status: 200 });
+        let relayResults = null;
+        if (data.config && !data.fromMaster && data.relayToLinkedPanels && Array.isArray(nextConfig.linkedPanels) && nextConfig.linkedPanels.length > 0) {
+            // این فراخوانی از سمت خودِ Worker انجام می‌شه (نه مرورگر)، پس محدودیت CORS
+            // نداره — بر خلاف نسخه‌ی قبلی که مستقیم از مرورگر به دامنه‌ی هر پنل دیگه
+            // فچ می‌زد و به همین دلیل بی‌صدا توسط مرورگر بلاک می‌شد. هر پنل با «رمز
+            // خوشه»ی مخصوص خودش (ذخیره‌شده موقع Add Panel) صدا زده می‌شه.
+            relayResults = await Promise.all(nextConfig.linkedPanels.map(async (panel) => {
+                try {
+                    const res = await fetch(`https://${panel.host}/${encodeURI(panel.apiRoute)}/api/sync`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ key: panel.masterKey, config: data.config, fromMaster: true }),
+                        signal: AbortSignal.timeout(10000)
+                    });
+                    return { host: panel.host, ok: res.ok };
+                } catch (e) {
+                    return { host: panel.host, ok: false };
+                }
+            }));
+        }
+
+        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute, relayResults }), { status: 200 });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
 
@@ -2324,6 +2472,15 @@ const botI18n = {
         btn_download_worker: "🧩 Download Worker Source",
         btn_download_worker_live: "🌩️ Download Real Live Code (Cloudflare only)",
         btn_upload_worker: "⬆️ Upload / Update Worker",
+        btn_update_all_panels: "🌐 Update All Panels",
+        msg_update_all_confirm: "This will deploy the latest version to THIS panel and to all {count} linked panel(s). Continue?",
+        msg_update_all_none_linked: "You have no linked panels yet — this will only update this panel.",
+        msg_update_all_running: "🚀 Updating this panel and all linked panels... this may take a moment.",
+        msg_update_all_result_header: "🌐 **Update All Panels — Result**",
+        msg_update_all_local_ok: "✅ This panel: updated to v{version}",
+        msg_update_all_local_fail: "❌ This panel: failed — {error}",
+        msg_update_all_panel_ok: "✅ {host}: updated",
+        msg_update_all_panel_fail: "❌ {host}: failed — {error}",
         msg_checking_update: "🔍 Checking for updates...",
         msg_preparing_download: "📦 Preparing worker source file...",
         msg_download_failed: "❌ Could not retrieve the worker source.",
@@ -2435,6 +2592,15 @@ const botI18n = {
         btn_download_worker: "🧩 دانلود سورس ورکر",
         btn_download_worker_live: "🌩️ دانلود کد واقعی (فقط کلودفلر)",
         btn_upload_worker: "⬆️ آپلود / آپدیت ورکر",
+        btn_update_all_panels: "🌐 آپدیت کل پنل‌ها",
+        msg_update_all_confirm: "این کار آخرین نسخه رو روی این پنل و روی تمام {count} پنل لینک‌شده دیپلوی می‌کنه. ادامه بدم؟",
+        msg_update_all_none_linked: "هنوز هیچ پنلی لینک نکردی — فقط همین پنل آپدیت می‌شه.",
+        msg_update_all_running: "🚀 در حال آپدیت این پنل و تمام پنل‌های لینک‌شده... ممکنه کمی طول بکشه.",
+        msg_update_all_result_header: "🌐 **نتیجه آپدیت کل پنل‌ها**",
+        msg_update_all_local_ok: "✅ این پنل: آپدیت شد به v{version}",
+        msg_update_all_local_fail: "❌ این پنل: ناموفق — {error}",
+        msg_update_all_panel_ok: "✅ {host}: آپدیت شد",
+        msg_update_all_panel_fail: "❌ {host}: ناموفق — {error}",
         msg_checking_update: "🔍 در حال بررسی بروزرسانی...",
         msg_preparing_download: "📦 در حال آماده‌سازی فایل سورس ورکر...",
         msg_download_failed: "❌ دریافت سورس ورکر ممکن نشد.",
@@ -2511,6 +2677,13 @@ async function fetchRemotePanelConfig(panel) {
 
 async function fetchRemotePanelUpdate(panel, action, extra = {}) {
     return await remotePanelFetch(panel, 'POST', '/api/update', { key: panel.masterKey, action, ...extra });
+}
+
+// Relays a manually-provided worker source (file/link/paste) to a linked panel,
+// so "update all linked panels" can push the exact same code that was just
+// deployed locally instead of each panel fetching its own copy from GitHub.
+async function fetchRemotePanelUploadWorker(panel, code) {
+    return await remotePanelFetch(panel, 'POST', `/api/upload-worker?key=${encodeURIComponent(panel.masterKey)}`, { code });
 }
 
 async function remotePanelWriteAction(panel, method, userId, body = null) {
@@ -3717,8 +3890,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{});
                         const langCode = sysConfig.tgBotLang || "fa";
                         const msg = langCode === "fa"
-                            ? `🔑 Master Key پنل \`${url}\` را ارسال کنید:`
-                            : `🔑 Send the Master Key for \`${url}\`:`;
+                            ? `🔑 «کلید همگام‌سازی خوشه» پنل \`${url}\` رو بفرست (تنظیمات → امنیت → Cluster Sync Secret همون پنل):`
+                            : `🔑 Send the Cluster Sync Secret for \`${url}\` (found in its Settings → Security → Cluster Sync Secret):`;
                         await sendOrEdit(chatId, msg, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] });
                         return new Response("OK", { status: 200 });
                     }
@@ -4256,7 +4429,7 @@ function getAllProfiles(targetSub = null) {
 
 function buildSingleUri(hostName) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.linkedPanels) allHostNames.push(...sysConfig.linkedPanels.map(p => p.host).filter(Boolean));
     let finalHost = allHostNames[0];
     let finalIP = getCleanIps(finalHost)[0];
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
@@ -4379,7 +4552,7 @@ function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
 
 async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.linkedPanels) allHostNames.push(...sysConfig.linkedPanels.map(p => p.host).filter(Boolean));
 
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
@@ -4435,7 +4608,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
 
 async function buildYamlProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.linkedPanels) allHostNames.push(...sysConfig.linkedPanels.map(p => p.host).filter(Boolean));
 
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let proxies = [];
@@ -4621,7 +4794,7 @@ function getIpTypeLabel(ip) {
 
 async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.linkedPanels) allHostNames.push(...sysConfig.linkedPanels.map(p => p.host).filter(Boolean));
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
     await preloadIpFlags(profiles, allHostNames);
@@ -4921,7 +5094,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
 
 async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
-    if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
+    if (sysConfig.linkedPanels) allHostNames.push(...sysConfig.linkedPanels.map(p => p.host).filter(Boolean));
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
     await preloadIpFlags(profiles, allHostNames);
@@ -5997,15 +6170,27 @@ function getDashboardUI(hasDB) {
                                   <input type="text" id="cfg-uuid" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none font-mono text-sm">
                               </div>
                               <div class="space-y-1">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_path">API Route (Hidden Path)</label>
-                                  <input type="text" id="cfg-path" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
-                              </div>
-                              <div class="space-y-1">
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_pass">Master Key</label>
                                   <div class="relative">
-                                      <input type="password" id="cfg-pass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none pe-12">
+                                      <input type="password" id="cfg-pass" data-i18n-ph="ph_pass" placeholder="Leave blank to keep the current password" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none pe-12">
                                       <button type="button" onclick="const n=document.getElementById('cfg-pass');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
                                   </div>
+                                  <p class="text-[11px] text-slate-400 ms-1" data-i18n="hint_pass_hashed">🔒 Stored as a salted hash — this field is always empty on load, on purpose.</p>
+                              </div>
+                              <div class="space-y-1">
+                                  <div class="flex items-center justify-between ms-1">
+                                      <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_sync_secret">Cluster Sync Secret</label>
+                                      <button type="button" onclick="regenSyncSecret()" class="text-xs text-primary bg-primary/10 hover:bg-primary/20 px-2 py-1 rounded transition-colors duration-200" data-i18n="btn_regen_sync_secret">Regenerate</button>
+                                  </div>
+                                  <div class="relative">
+                                      <input type="text" id="cfg-sync-secret" readonly class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-100 dark:bg-slate-900 outline-none font-mono text-xs pe-12">
+                                      <button type="button" onclick="const el=document.getElementById('cfg-sync-secret'); navigator.clipboard.writeText(el.value); this.innerText='✅';setTimeout(()=>this.innerText='📋',1200)" class="absolute inset-y-0 end-0 flex items-center px-4 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">📋</button>
+                                  </div>
+                                  <p class="text-[11px] text-slate-400 ms-1" data-i18n="hint_sync_secret">Separate from your password — paste this into another panel's "Add Panel" step, or into its Force Sync, to link them. Regenerating it disconnects any panel using the old value until it's updated too.</p>
+                              </div>
+                              <div class="space-y-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_path">API Route (Hidden Path)</label>
+                                  <input type="text" id="cfg-path" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                               </div>
                               <div class="space-y-1 md:col-span-2 border-t border-slate-100 dark:border-darkborder/50 pt-5 mt-1">
                                   <div class="flex items-center justify-between mb-3">
@@ -6155,38 +6340,6 @@ function getDashboardUI(hasDB) {
                               </div>
                           </div>
                           <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
-                              <button type="button" onclick="toggleAccordion('acc-a2')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
-                                  <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🕸️</span><span data-i18n="acc_a2_title">Slave Worker Nodes (Cluster)</span></span>
-                                  <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                              </button>
-                              <div id="acc-a2" class="acc-body hidden px-6 pb-6">
-                              <div class="absolute top-0 end-0 bg-indigo-100 dark:bg-indigo-900/40 px-3 py-1 text-[10px] font-bold text-indigo-500 dark:text-indigo-400 rounded-bl-xl">CLUSTER</div>
-                              <div class="flex items-center justify-between mb-2">
-                                  <h3 class="text-sm uppercase font-black text-indigo-800 dark:text-indigo-300 tracking-wider flex items-center">
-                                      <svg class="w-5 h-5 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
-                                      <span data-i18n="slave_title">Slave Worker Nodes</span>
-                                  </h3>
-                              </div>
-                              <p class="text-xs text-indigo-600/80 dark:text-indigo-300/70 mb-4 leading-relaxed" data-i18n="slave_desc">Enter your other worker Domains (one per line). Master will push settings and users to them automatically, and include them in load-balanced subscriptions!</p>
-                              <div class="relative">
-                                  <textarea id="cfg-nodes" rows="3" placeholder="node1.worker.dev&#10;node2.domain.com" class="w-full px-4 py-3 pb-12 rounded-xl border border-indigo-200 dark:border-indigo-800/50 bg-white dark:bg-slate-900 focus:border-indigo-500 focus:ring-1 outline-none font-mono text-sm resize-none scrollbar-hide text-slate-700 dark:text-slate-300 placeholder:text-indigo-200 dark:placeholder:text-indigo-800/50"></textarea>
-                                  <div class="absolute bottom-3 end-3">
-                                      <button onclick="openSyncModal()" type="button" class="px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
-                                          <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                          <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
-                                      </button>
-                                     </div>
-                                   <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
-                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_allow_sync">Allow Sync </span>
-                                  <div class="relative inline-flex items-center cursor-pointer">
-                                      <input type="checkbox" id="cfg-allow-sync" class="sr-only peer">
-                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
-                                  </div>
-                              </label>
-                              </div>
-                              </div>
-                          </div>
-                          <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
                               <button type="button" onclick="toggleAccordion('acc-a3')" class="acc-toggle w-full flex items-center justify-between gap-3 px-6 py-4 text-start">
                                   <span class="flex items-center gap-2 text-sm font-bold text-slate-700 dark:text-slate-200"><span class="text-lg">🛡️</span><span data-i18n="acc_a3_title">TLS & Network</span></span>
                                   <svg class="acc-chevron w-4 h-4 text-slate-400 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
@@ -6322,6 +6475,13 @@ function getDashboardUI(hasDB) {
                               </div>
                               <p class="text-xs text-slate-400 mb-3" data-i18n="desc_linked_panels">Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.</p>
                               <div id="linked-panels-list" class="space-y-2"></div>
+                              <div class="mt-4 pt-4 border-t border-slate-100 dark:border-darkborder/50 flex items-center justify-between gap-3">
+                                  <p class="text-xs text-slate-400" data-i18n="desc_force_sync">Push selected settings to all linked panels above, using their saved Cluster Sync Secret.</p>
+                                  <button onclick="openSyncModal()" type="button" class="shrink-0 px-3 py-1.5 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold rounded-lg transition-colors flex items-center shadow-sm">
+                                      <svg id="sync-icon" class="w-3.5 h-3.5 me-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                      <span id="sync-btn-txt" data-i18n="force_sync">Force Sync Now</span>
+                                  </button>
+                              </div>
                               </div>
                           </div>
                           <div class="accordion-item bg-white dark:bg-darkcard rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder overflow-hidden">
@@ -6652,18 +6812,18 @@ function getDashboardUI(hasDB) {
                                               <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_users_desc">⚠ Replaces the ENTIRE subscriber list on the other panels with this one's — their own users will be deleted.</span>
                                           </span>
                                       </label>
-                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
-                                          <input type="checkbox" id="sync-opt-security" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                      <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder opacity-60 cursor-not-allowed">
+                                          <input type="checkbox" disabled class="mt-0.5 accent-primary shrink-0">
                                           <span>
-                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_security">Security (Master Key)</span>
-                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_security_desc">⚠ Overwrites the login password on the other panels.</span>
+                                              <span class="block text-sm font-bold text-slate-500 dark:text-slate-400" data-i18n="sync_opt_security">Security (Master Key)</span>
+                                              <span class="block text-[11px] text-slate-400" data-i18n="sync_opt_security_desc">Not syncable: your password is stored as a salted hash and never sent to the browser, so it can't be replicated from here. Set it manually on each panel, or sync the Cluster Sync Secret below instead.</span>
                                           </span>
                                       </label>
                                       <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50">
-                                          <input type="checkbox" id="sync-opt-cluster" class="sync-simple mt-0.5 accent-primary shrink-0">
+                                          <input type="checkbox" id="sync-opt-syncsecret" class="sync-simple mt-0.5 accent-primary shrink-0">
                                           <span>
-                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_cluster">Slave Node List</span>
-                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_cluster_desc">⚠ Overwrites which nodes the target treats as ITS slaves — can create sync loops. Leave unchecked unless you mean it.</span>
+                                              <span class="block text-sm font-bold text-slate-700 dark:text-slate-200" data-i18n="sync_opt_syncsecret">Cluster Sync Secret</span>
+                                              <span class="block text-[11px] text-amber-500" data-i18n="sync_opt_syncsecret_desc">⚠ Overwrites the machine-to-machine credential on the other panels — useful right after adding a new panel to the cluster, otherwise usually unnecessary.</span>
                                           </span>
                                       </label>
                                       <label class="flex items-start gap-3 p-3 rounded-xl border border-slate-200 dark:border-darkborder opacity-60 cursor-not-allowed">
@@ -6739,7 +6899,7 @@ function getDashboardUI(hasDB) {
                                           <input type="text" id="add-panel-url" placeholder="myworker.workers.dev" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                       </div>
                                       <div>
-                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_panel_key">Master Key</label>
+                                          <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="lbl_panel_key">Cluster Sync Secret</label>
                                           <div class="relative">
                                               <input type="password" id="add-panel-key" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm pe-10">
                                               <button type="button" onclick="const n=document.getElementById('add-panel-key');n.type=n.type==='password'?'text':'password'" class="absolute inset-y-0 end-0 flex items-center px-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">👁️</button>
@@ -6809,6 +6969,14 @@ function getDashboardUI(hasDB) {
                                           <label class="block text-xs font-bold text-slate-500 mb-1" data-i18n="upload_worker_paste_lbl">Paste Code Directly</label>
                                           <textarea id="upload-worker-code" dir="ltr" rows="4" placeholder="// paste _worker.js content here" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono text-start"></textarea>
                                       </div>
+                                      <div class="border-t border-slate-200 dark:border-darkborder pt-3">
+                                          <label class="flex items-center gap-2 text-xs font-bold text-slate-600 dark:text-slate-300 cursor-pointer">
+                                              <input type="checkbox" id="upload-worker-sync-linked" class="w-4 h-4 rounded text-primary focus:ring-primary">
+                                              <span data-i18n="upload_worker_sync_linked_lbl">Also update linked panels</span>
+                                          </label>
+                                          <p class="text-[11px] text-slate-400 mt-1" data-i18n="upload_worker_sync_linked_desc">Deploys this exact same code to every linked panel too, using each one's saved Cluster Sync Secret.</p>
+                                      </div>
+                                      <p id="upload-worker-linked-status" class="text-xs font-bold min-h-[1rem]"></p>
                                   </div>
                               </div>
                               <div class="px-6 py-4 shrink-0 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard rounded-b-3xl">
@@ -7166,9 +7334,12 @@ function getDashboardUI(hasDB) {
                   stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
+                  ph_pass: "Leave blank to keep the current password", hint_pass_hashed: "🔒 Stored as a salted hash — this field is always empty on load, on purpose.",
+                  lbl_sync_secret: "Cluster Sync Secret", btn_regen_sync_secret: "Regenerate",
+                  hint_sync_secret: "Separate from your password — paste this into another panel's \\\"Add Panel\\\" step, or into its Force Sync, to link them. Regenerating it disconnects any panel using the old value until it's updated too.",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
                   lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
-                  lbl_linked_panels: "Linked Panels", desc_linked_panels: "Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.", btn_add_panel: "Add Panel", no_linked_panels: "No linked panels yet.", modal_add_panel_title: "Add Linked Panel", lbl_panel_url: "Panel URL", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "Master Key", btn_verify_add: "Verify & Add", msg_verifying_panel: "Verifying panel...", msg_panel_verify_fail: "Failed to connect. Check the URL or Master Key.", msg_panel_added: "Panel added successfully.", msg_panel_admin_mismatch: "This panel belongs to a different Telegram admin and cannot be added.", confirm_remove_panel: "Are you sure you want to remove this panel?",
+                  lbl_linked_panels: "Linked Panels", desc_linked_panels: "Manage other panels (Workers) linked to this one. They can be switched between via the Telegram bot.", btn_add_panel: "Add Panel", no_linked_panels: "No linked panels yet.", modal_add_panel_title: "Add Linked Panel", lbl_panel_url: "Panel URL", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "Cluster Sync Secret", btn_verify_add: "Verify & Add", msg_verifying_panel: "Verifying panel...", msg_panel_verify_fail: "Failed to connect. Check the URL or Cluster Sync Secret (found in that panel's Settings → Security).", msg_panel_added: "Panel added successfully.", msg_panel_admin_mismatch: "This panel belongs to a different Telegram admin and cannot be added.", confirm_remove_panel: "Are you sure you want to remove this panel?",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
@@ -7188,7 +7359,7 @@ function getDashboardUI(hasDB) {
                   lbl_u_max_config:"Max Configs",
                   lbl_u_max_conn:"Max Concurrent Connections",
                   acc_b1_title:"Protocol & Ports", acc_b2_title:"Identity & Security", acc_b3_title:"Update & Access", acc_b4_title:"Backup & Restore",
-                  acc_a1_title:"Clean IPs (Multi-Generator)", acc_a2_title:"Slave Worker Nodes (Cluster)", acc_a3_title:"TLS & Network", acc_a4_title:"Config Naming",
+                  acc_a1_title:"Clean IPs (Multi-Generator)", acc_a3_title:"TLS & Network", acc_a4_title:"Config Naming",
                   acc_a5_title:"Toggles & Switches", acc_a6_title:"Telegram Bot", acc_a7_title:"Linked Panels", acc_a8_title:"Cloudflare Analytics",
                   login_password:"Password",
                   lbl_u_ipproxy:"User Proxy IP(s) (Optional - overrides global Clean IP, comma/newline separated)",
@@ -7203,7 +7374,6 @@ function getDashboardUI(hasDB) {
                   ov_system: "System", ov_recent_activity: "Recent Activity", ov_view_all: "View All →", ov_loading: "Loading...",
                    ov_quick_actions: "Quick Actions", ov_add_user: "Add User", ov_backup_config: "Backup Config", ov_refresh: "Refresh Statistics", ov_manage_users: "Manage Users",
                    ov_gb_unit: "GB",
-                   lbl_allow_sync:"Allow Sync",
                    limit_hour_from:"From",
                     limit_hour_to:"To",
                    lbl_limit_hour:"Access Hours (Optional)",
@@ -7231,9 +7401,12 @@ function getDashboardUI(hasDB) {
                   stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
+                  ph_pass: "برای حفظ رمز فعلی، خالی بگذارید", hint_pass_hashed: "🔒 به‌صورت هش نمک‌دار ذخیره می‌شه — این فیلد عمداً همیشه موقع بارگذاری خالیه.",
+                  lbl_sync_secret: "کلید همگام‌سازی خوشه", btn_regen_sync_secret: "ساخت مجدد",
+                  hint_sync_secret: "جدا از رمز عبورته — این رو تو مرحله «افزودن پنل» یا Force Sync یه پنل دیگه وارد کن تا بهم لینک بشن. ساخت مجدد، هر پنلی که هنوز مقدار قدیمی رو داره قطع می‌کنه تا وقتی به‌روزش کنی.",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
                   lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
-                  lbl_linked_panels: "پنل‌های لینک‌شده", desc_linked_panels: "پنل‌های دیگر (ورکرها) که به این پنل لینک شده‌اند را مدیریت کنید. می‌توان از طریق ربات تلگرام بین آن‌ها سوییچ کرد.", btn_add_panel: "افزودن پنل", no_linked_panels: "هنوز هیچ پنلی لینک نشده است.", modal_add_panel_title: "افزودن پنل لینک‌شده", lbl_panel_url: "آدرس پنل", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "Master Key", btn_verify_add: "تایید و افزودن", msg_verifying_panel: "در حال تایید پنل...", msg_panel_verify_fail: "اتصال ناموفق بود. آدرس یا Master Key را بررسی کنید.", msg_panel_added: "پنل با موفقیت اضافه شد.", msg_panel_admin_mismatch: "این پنل متعلق به ادمین تلگرام دیگری است و قابل افزودن نیست.", confirm_remove_panel: "آیا از حذف این پنل مطمئن هستید؟",
+                  lbl_linked_panels: "پنل‌های لینک‌شده", desc_linked_panels: "پنل‌های دیگر (ورکرها) که به این پنل لینک شده‌اند را مدیریت کنید. می‌توان از طریق ربات تلگرام بین آن‌ها سوییچ کرد.", btn_add_panel: "افزودن پنل", no_linked_panels: "هنوز هیچ پنلی لینک نشده است.", modal_add_panel_title: "افزودن پنل لینک‌شده", lbl_panel_url: "آدرس پنل", ph_panel_url: "myworker.workers.dev", lbl_panel_key: "کلید همگام‌سازی خوشه", btn_verify_add: "تایید و افزودن", msg_verifying_panel: "در حال تایید پنل...", msg_panel_verify_fail: "اتصال ناموفق بود. آدرس یا کلید همگام‌سازی خوشه (تنظیمات → امنیت همون پنل) رو بررسی کنید.", msg_panel_added: "پنل با موفقیت اضافه شد.", msg_panel_admin_mismatch: "این پنل متعلق به ادمین تلگرام دیگری است و قابل افزودن نیست.", confirm_remove_panel: "آیا از حذف این پنل مطمئن هستید؟",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
@@ -7253,7 +7426,7 @@ function getDashboardUI(hasDB) {
                   metrics_live: "وضعیت زنده مصرف اتصالات و پردازش", no_metrics: "هنوز داده‌ای از تراکنش و اتصالات فعال ثبت نشده است.", run_diagnostics: "⚡ اجرای عیب‌یابی شبکه",
                   target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
                   lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
-                  slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
+                  desc_force_sync: "تنظیمات انتخابی رو با «رمز خوشه» ذخیره‌شده‌ی هرکدوم، به تمام پنل‌های لینک‌شده‌ی بالا ارسال کن.",
                   force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
                   modal_sync_title: "همگام‌سازی تنظیمات با نودها", modal_sync_desc: "انتخاب کن کدام بخش‌های تنظیمات برای نودهای دیگر ارسال شود.",
                   modal_sync_select_all: "انتخاب همه", modal_sync_select_none: "لغو انتخاب همه",
@@ -7266,8 +7439,8 @@ function getDashboardUI(hasDB) {
                   sync_opt_domain: "دامنه اختصاصی پنل", sync_opt_domain_desc: "⚠ معمولاً هر پنل دامنه خودش را دارد — فقط در صورتی تیک بزنید که عمداً می‌خواهید مشترک باشد.",
                   sync_opt_identity: "هویت (UUID و مسیر API)", sync_opt_identity_desc: "⚠ مسیر پنهان و UUID دستگاه پنل مقصد را تغییر می‌دهد — لینک‌ها/بوکمارک‌های قدیمی آن از کار می‌افتند.",
                   sync_opt_users: "کاربران", sync_opt_users_desc: "⚠ کل لیست مشترکین پنل‌های دیگر را با این پنل جایگزین می‌کند — کاربران خودشان حذف می‌شوند.",
-                  sync_opt_security: "امنیت (رمز اصلی)", sync_opt_security_desc: "⚠ رمز عبور ورود را روی سایر پنل‌ها بازنویسی می‌کند.",
-                  sync_opt_cluster: "فهرست نودهای فرعی", sync_opt_cluster_desc: "⚠ لیست نودهای فرعیِ پنل مقصد را بازنویسی می‌کند — امکان ایجاد حلقه همگام‌سازی وجود دارد. مگر عمداً بخواهید، تیک نزنید.",
+                  sync_opt_security: "امنیت (رمز اصلی)", sync_opt_security_desc: "قابل همگام‌سازی نیست: رمز عبورت به‌صورت هش نمک‌دار ذخیره می‌شه و هیچ‌وقت برای مرورگر ارسال نمی‌شه، پس از اینجا قابل کپی نیست. رمز رو دستی رو هر پنل تنظیم کن، یا به‌جاش «کلید همگام‌سازی خوشه» رو سینک کن.",
+                  sync_opt_syncsecret: "کلید همگام‌سازی خوشه", sync_opt_syncsecret_desc: "⚠ کلید اعتماد بین‌پنلی رو روی پنل‌های دیگه بازنویسی می‌کنه — معمولاً فقط درست بعد از اضافه‌کردن یه پنل جدید به خوشه لازمه.",
                   sync_opt_twofa: "احراز هویت دو مرحله‌ای (2FA)", sync_opt_twofa_desc: "قابل همگام‌سازی نیست: پنل عمداً هرگز رمز 2FA را برای مرورگر ارسال نمی‌کند، پس از اینجا قابل تکرار نیست.",
                   sync_opt_bot: "تنظیمات ربات تلگرام", sync_opt_bot_desc: "⚠ توکن/ادمین ربات را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است ربات آن‌ها دچار اختلال شود.",
                   sync_opt_cf: "تنظیمات API کلادفلر", sync_opt_cf_desc: "⚠ اکانت/توکن/نام Worker را روی سایر پنل‌ها بازنویسی می‌کند — ممکن است دیپلوی یا آمار آن‌ها دچار اختلال شود.",
@@ -7297,8 +7470,11 @@ function getDashboardUI(hasDB) {
                   upload_worker_file_lbl:"آپلود فایل .js", upload_worker_paste_lbl:"چسباندن مستقیم کد",
                   upload_worker_deploy_btn:"همین حالا دیپلوی کن", upload_worker_empty:"لطفاً یه آدرس، فایل یا کد وارد کن.",
                   upload_worker_confirm:"این کار ورکر در حال اجرا رو بازنویسی می‌کنه. ادامه بدم؟",
+                  upload_worker_confirm_linked:"این کار ورکر این پنل و همچنین تمام پنل‌های لینک‌شده رو بازنویسی می‌کنه. ادامه بدم؟",
                   upload_worker_success:"ورکر با موفقیت آپدیت شد.", upload_worker_failed:"آپلود ناموفق بود: ",
-                  acc_a1_title:"آی‌پی‌های پاک (چند سازنده)", acc_a2_title:"گره‌های برده (کلاستر)", acc_a3_title:"شبکه و امنیت TLS", acc_a4_title:"نام‌گذاری کانفیگ",
+                  upload_worker_sync_linked_lbl:"پنل‌های لینک‌شده هم آپدیت بشن", upload_worker_sync_linked_desc:"همین کد رو با استفاده از کلید همگام‌سازی خوشه، روی تمام پنل‌های لینک‌شده هم دیپلوی می‌کنه.",
+                  upload_worker_linked_summary:"پنل‌های لینک‌شده آپدیت‌شده: {ok}/{total}",
+                  acc_a1_title:"آی‌پی‌های پاک (چند سازنده)", acc_a3_title:"شبکه و امنیت TLS", acc_a4_title:"نام‌گذاری کانفیگ",
                   acc_a5_title:"سوییچ‌های عملکردی", acc_a6_title:"ربات تلگرام", acc_a7_title:"پنل‌های متصل", acc_a8_title:"آنالیتیکس کلودفلر",
                   login_password:"رمز ورود",
                   lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
@@ -7312,7 +7488,6 @@ function getDashboardUI(hasDB) {
                    ov_system: "سیستم", ov_recent_activity: "فعالیت‌های اخیر", ov_view_all: "مشاهده همه ←", ov_loading: "در حال بارگذاری...",
                    ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
                    ov_gb_unit: "گیگابایت",
-                    lbl_allow_sync:"اجازه همگام سازی",
                    limit_hour_from:"از",
                     limit_hour_to:"تا",
                    lbl_limit_hour:"ساعات دسترسی",
@@ -8287,12 +8462,18 @@ if (users.length > 0) {
               const url = document.getElementById('upload-worker-url').value.trim();
               const fileInput = document.getElementById('upload-worker-file');
               const pastedCode = document.getElementById('upload-worker-code').value.trim();
+              const syncLinked = !!document.getElementById('upload-worker-sync-linked')?.checked;
+              const linkedStatusEl = document.getElementById('upload-worker-linked-status');
+              if (linkedStatusEl) linkedStatusEl.textContent = '';
 
               if (!url && !fileInput.files[0] && !pastedCode) {
                   alert(i18n[lang]?.upload_worker_empty || 'Please provide a URL, a file, or pasted code.');
                   return;
               }
-              if (!confirm(i18n[lang]?.upload_worker_confirm || 'This will overwrite the currently deployed worker. Continue?')) return;
+              const confirmMsg = syncLinked
+                  ? (i18n[lang]?.upload_worker_confirm_linked || 'This will overwrite the currently deployed worker on THIS panel and on every linked panel. Continue?')
+                  : (i18n[lang]?.upload_worker_confirm || 'This will overwrite the currently deployed worker. Continue?');
+              if (!confirm(confirmMsg)) return;
 
               const btn = document.getElementById('btn-confirm-upload-worker');
               const originalHtml = btn.innerHTML;
@@ -8309,6 +8490,7 @@ if (users.length > 0) {
                   } else {
                       payload = { url: url };
                   }
+                  payload.syncLinked = syncLinked;
 
                   const res = await fetch(baseRoute + '/api/upload-worker', {
                       method: 'POST',
@@ -8318,7 +8500,20 @@ if (users.length > 0) {
                   const data = await res.json();
                   if (!data.success) throw new Error(data.error || ('HTTP ' + res.status));
 
-                  alert(i18n[lang]?.upload_worker_success || 'Worker updated successfully.');
+                  let successMsg = i18n[lang]?.upload_worker_success || 'Worker updated successfully.';
+                  if (syncLinked && Array.isArray(data.linkedResults)) {
+                      const ok = data.linkedResults.filter(r => r.success).length;
+                      const total = data.linkedResults.length;
+                      const linkedSummary = (i18n[lang]?.upload_worker_linked_summary || 'Linked panels updated: {ok}/{total}').replace('{ok}', ok).replace('{total}', total);
+                      successMsg += '\\n' + linkedSummary;
+                      const failed = data.linkedResults.filter(r => !r.success);
+                      if (failed.length && linkedStatusEl) {
+                          linkedStatusEl.className = 'text-xs font-bold min-h-[1rem] text-amber-600 dark:text-amber-400';
+                          linkedStatusEl.textContent = failed.map(f => f.host + ': ' + (f.error || '?')).join(' | ');
+                      }
+                  }
+
+                  alert(successMsg);
                   document.getElementById('modal-upload-worker').classList.add('hidden');
               } catch (e) {
                   alert((i18n[lang]?.upload_worker_failed || 'Upload failed: ') + e.message);
@@ -8392,7 +8587,7 @@ if (users.length > 0) {
               const el = id => document.getElementById(id);
               const payload = {
                   mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
-                  apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
+                  apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, syncSecret: el('cfg-sync-secret').value, agent: el('cfg-fp').value,
                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
@@ -8427,6 +8622,7 @@ if (users.length > 0) {
                       mapId('cfg-uuid', conf.deviceId);
                       mapId('cfg-path', conf.apiRoute);
                       mapId('cfg-pass', conf.masterKey);
+                      mapId('cfg-sync-secret', conf.syncSecret);
                       mapId('cfg-fp', conf.agent);
                       mapId('cfg-dns', conf.resolveIp);
                       mapId('cfg-custom-dns', conf.customDns);
@@ -8611,17 +8807,16 @@ if (users.length > 0) {
                       syncCheckboxesFromSelect();
                       document.getElementById('cfg-uuid').value = conf.deviceId || '';
                       document.getElementById('cfg-path').value = conf.apiRoute || '';
-                      document.getElementById('cfg-pass').value = conf.masterKey || '';
+                      document.getElementById('cfg-pass').value = '';
+                      document.getElementById('cfg-sync-secret').value = conf.syncSecret || '';
                       document.getElementById('cfg-fp').value = conf.agent || 'chrome';
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
                       document.getElementById('cfg-custom-dns').value = conf.customDns || 'https://cloudflare-dns.com/dns-query';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
-                      document.getElementById('cfg-nodes').value = conf.slaveNodes || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
                       document.getElementById('cfg-relay').value = conf.backupRelay || '';
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
-                      document.getElementById('cfg-allow-sync').checked = conf.allowSyncWorker || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
                       document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
@@ -8645,7 +8840,7 @@ if (users.length > 0) {
                       try { twofaRefreshStatus(); } catch(fe) { console.error(fe); }
                       if (!silent) switchTab('overview');
 
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-nodes','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
@@ -8762,7 +8957,7 @@ if (users.length > 0) {
                   config: {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -8772,7 +8967,6 @@ if (users.length > 0) {
                       subUserAgent: el('cfg-sub-ua').value,
                       customPanelUrl: el('cfg-custom-panel-url').value,
                       nameStrategy: el('cfg-name-strategy').value,
-                      allowSyncWorker: el('cfg-allow-sync').checked,
                       namePrefix: el('cfg-name-prefix').value
                   }
               };
@@ -8814,10 +9008,10 @@ if (users.length > 0) {
           }
 
           function openSyncModal() {
-              const nodesRaw = document.getElementById('cfg-nodes').value;
-              if (!nodesRaw || nodesRaw.trim() === '') {
-                  const noSlaveMsg = lang === 'fa' ? 'هیچ نود فرعی مشخص نشده است.' : 'No slave nodes specified.';
-                  alert(noSlaveMsg);
+              const panels = (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : [];
+              if (panels.length === 0) {
+                  const noPanelsMsg = lang === 'fa' ? 'هیچ پنل لینک‌شده‌ای وجود ندارد. اول از بخش «پنل‌های لینک‌شده» یک پنل اضافه کن.' : 'No linked panels yet. Add one from the "Linked Panels" section first.';
+                  alert(noPanelsMsg);
                   return;
               }
               document.getElementById('modal-sync-nodes').classList.remove('hidden');
@@ -8834,10 +9028,8 @@ if (users.length > 0) {
 
               const el = id => document.getElementById(id);
 
-              // هر گروه فقط وقتی تیک خورده باشه فیلدهاش به payload اضافه می‌شه. سمت
-              // سرور دیگه دیگه کل sysConfig رو به نودها ریلی نمی‌کنه — فقط همین
-              // "config" جزئی که اینجا می‌سازیم ارسال می‌شه، پس هرچی این‌جا تیک
-              // نخوره، دست‌نخورده روی پنل مقصد باقی می‌مونه.
+              // هر گروه فقط وقتی تیک خورده باشه فیلدهاش به payload اضافه می‌شه، پس هرچی
+              // این‌جا تیک نخوره، دست‌نخورده روی پنل مقصد باقی می‌مونه.
               let config = {};
 
               const groupBuilders = {
@@ -8850,8 +9042,7 @@ if (users.length > 0) {
                   domain: () => ({ customPanelUrl: el('cfg-custom-panel-url').value }),
                   identity: () => ({ deviceId: el('cfg-uuid').value, apiRoute: el('cfg-path').value }),
                   users: () => ({ users: (window.nahanConfig && window.nahanConfig.users) ? window.nahanConfig.users : [] }),
-                  security: () => ({ masterKey: el('cfg-pass').value }),
-                  cluster: () => ({ slaveNodes: el('cfg-nodes').value })
+                  syncsecret: () => ({ syncSecret: el('cfg-sync-secret').value })
               };
               Object.keys(groupBuilders).forEach(group => {
                   const cb = el('sync-opt-' + group);
@@ -8879,21 +9070,33 @@ if (users.length > 0) {
                   return;
               }
 
-              const payload = { key: sessionKey, config };
+              const panels = (window.nahanConfig && Array.isArray(window.nahanConfig.linkedPanels)) ? window.nahanConfig.linkedPanels : [];
 
+              // خودِ فچ به هر پنل رو دیگه از مرورگر انجام نمی‌دیم (چون Cross-Origin و
+              // مشمول CORS می‌شه و بی‌صدا بلاک می‌شد) — یه درخواست به بک‌اند خودمون
+              // می‌فرستیم و از اونجا (Worker به Worker، بدون محدودیت CORS) به هر پنل با
+              // «رمز خوشه»ی خودش (ذخیره‌شده موقع Add Panel) پخش می‌شه.
+              let successCount = 0;
               try {
-                  const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
-                  if (res.ok) {
-                      btnTxt.innerText = 'Success!';
-                  } else {
-                      btnTxt.innerText = 'Sync Failed';
+                  const res = await fetch(baseRoute + '/api/sync', {
+                      method: 'POST',
+                      body: JSON.stringify({ key: sessionKey, config, relayToLinkedPanels: true })
+                  });
+                  const result = await res.json();
+                  if (Array.isArray(result.relayResults)) {
+                      successCount = result.relayResults.filter(r => r.ok).length;
                   }
-              } catch (e) {
-                  btnTxt.innerText = 'Network Error';
-              } finally {
-                  icon.classList.remove('animate-spin');
-                  setTimeout(() => { btnTxt.innerText = 'Force Sync Now'; }, 3000);
+              } catch (e) {}
+
+              if (successCount === panels.length && panels.length > 0) {
+                  btnTxt.innerText = lang === 'fa' ? \`✅ \${successCount}/\${panels.length} پنل\` : \`✅ \${successCount}/\${panels.length} panels\`;
+              } else if (successCount > 0) {
+                  btnTxt.innerText = lang === 'fa' ? \`⚠️ \${successCount}/\${panels.length} پنل\` : \`⚠️ \${successCount}/\${panels.length} panels\`;
+              } else {
+                  btnTxt.innerText = lang === 'fa' ? 'همگام‌سازی ناموفق' : 'Sync Failed';
               }
+              icon.classList.remove('animate-spin');
+              setTimeout(() => { btnTxt.innerText = 'Force Sync Now'; }, 4000);
           }
 
           document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
@@ -9209,7 +9412,7 @@ if (users.length > 0) {
               }
 
               if (!verifyRes || !verifyRes.success) {
-                  statusEl.textContent = i18n[lang]?.msg_panel_verify_fail || 'Failed to connect. Check the URL or Master Key.';
+                  statusEl.textContent = i18n[lang]?.msg_panel_verify_fail || 'Failed to connect. Check the URL or Cluster Sync Secret.';
                   statusEl.className = 'text-xs font-bold min-h-[1rem] text-red-500';
                   btn.disabled = false;
                   btn.innerText = origBtnText;
@@ -9601,6 +9804,28 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               document.getElementById('modal-edit-user').classList.add('hidden');
               renderUsersTable();
               doSaveDirectly();
+          }
+
+          async function regenSyncSecret() {
+              const msg = lang === 'fa'
+                  ? 'یه کلید همگام‌سازی جدید ساخته می‌شه. هر پنل لینک‌شده‌ای که هنوز کلید قدیمی رو داره، تا وقتی به‌روزش نکنی قطع می‌مونه. ادامه می‌دی؟'
+                  : "A new sync secret will be generated. Any linked panel still using the old one will be disconnected until you update it there too. Continue?";
+              if (!confirm(msg)) return;
+              const bytes = crypto.getRandomValues(new Uint8Array(20));
+              const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+              let bits = ''; bytes.forEach(b => bits += b.toString(2).padStart(8, '0'));
+              let newSecret = '';
+              for (let i = 0; i + 5 <= bits.length; i += 5) newSecret += alphabet[parseInt(bits.substring(i, i + 5), 2)];
+              try {
+                  const res = await fetch(baseRoute + '/api/sync', {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ key: sessionKey, config: { syncSecret: newSecret } })
+                  });
+                  if (res.ok) {
+                      document.getElementById('cfg-sync-secret').value = newSecret;
+                      if (window.nahanConfig) window.nahanConfig.syncSecret = newSecret;
+                  }
+              } catch (e) {}
           }
 
           async function doSaveDirectly() {
