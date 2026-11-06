@@ -1,5 +1,11 @@
 # Nahan obfuscator r3 — 2026-11-06
 
+**Superseded:** This archived loader uses `new Function` and can fail on Workers
+with startup eval disabled. Use `../2026-11-06-obfuscator-r4/mobhamsaziv4.html`.
+The previously missing uploaded Worker has since been recovered and is included
+in `../2026-11-06-r3/` with a static v4 build. The notes below describe the
+original recovery state of this archive.
+
 This release contains the recovered, corrected `mobhamsaziv2.html` only.
 Download the HTML file and open it locally to use the obfuscator.
 
